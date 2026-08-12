@@ -1,7 +1,7 @@
 {
   "name": "pi-bifrost-provider",
   "version": "0.1.0",
-  "description": "A Bifrost OpenAI Chat Completions provider for the pi coding agent",
+  "description": "A Bifrost AI Gateway provider for the pi coding agent",
   "type": "module",
   "keywords": [
     "pi-package",

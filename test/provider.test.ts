@@ -227,14 +227,19 @@ test("configures and persists the native provider through /login", async () => {
 		return mockDiscoveryResponse();
 	};
 	const provider = createBifrostProvider({ fetch: IS_INTEGRATION ? fetch : mockFetch });
+	assert.equal(provider.name, "Bifrost AI Gateway");
 	const login = provider.auth.apiKey?.login;
 	assert.ok(login);
 	const answers = [loginUrl, "", virtualKey];
 	const notifications: string[] = [];
+	const infoLinks: string[] = [];
 	const credential = await login({
 		signal: new AbortController().signal,
 		prompt: async () => answers.shift() ?? "",
-		notify: (event) => notifications.push(event.type),
+		notify: (event) => {
+			notifications.push(event.type);
+			if (event.type === "info") infoLinks.push(...(event.links?.map((link) => link.url) ?? []));
+		},
 	});
 	const normalizedLoginUrl = normalizeBifrostUrl(loginUrl);
 
@@ -252,6 +257,7 @@ test("configures and persists the native provider through /login", async () => {
 		assert.equal(requests[0]?.headers.get("x-bf-vk"), "sk-bf-login");
 	}
 	assert.deepEqual(notifications, ["info", "progress"]);
+	assert.deepEqual(infoLinks, ["https://docs.getbifrost.ai/overview", "https://www.getmaxim.ai/bifrost"]);
 	assert.ok(provider.getModels().some((model) => model.id === EXPECTED_MODEL_ID));
 
 	let persistedModels: readonly unknown[] | undefined;

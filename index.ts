@@ -474,7 +474,7 @@ export function createBifrostProvider(options: CreateBifrostProviderOptions = {}
 
 	const base = createProvider({
 		id: PROVIDER_ID,
-		name: "Bifrost",
+		name: "Bifrost AI Gateway",
 		baseUrl: ambientConfig?.url,
 		auth: {
 			apiKey: {
@@ -483,7 +483,10 @@ export function createBifrostProvider(options: CreateBifrostProviderOptions = {}
 					interaction.notify({
 						type: "info",
 						message: "Configure the Bifrost gateway. API and virtual keys are optional.",
-						links: [{ url: "https://docs.getbifrost.ai/overview", label: "Bifrost documentation" }],
+						links: [
+							{ url: "https://docs.getbifrost.ai/overview", label: "Bifrost documentation" },
+							{ url: "https://www.getmaxim.ai/bifrost", label: "Bifrost homepage" },
+						],
 					});
 					const url = normalizeBifrostUrl(
 						await interaction.prompt({
