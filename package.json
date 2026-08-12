@@ -21,8 +21,11 @@
     ]
   },
   "scripts": {
+    "bifrost": "npx -y @maximhq/bifrost",
+    "fixture": "tsx test/run-tests.ts --fixture",
     "check": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts"
+    "test": "tsx test/run-tests.ts",
+    "test:integration": "tsx test/run-tests.ts --integration"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.84.1",

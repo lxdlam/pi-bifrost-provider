@@ -1,0 +1,17 @@
+{
+  "fixtures": [
+    {
+      "match": {
+        "userMessage": "pi bifrost provider test"
+      },
+      "response": {
+        "content": "Bifrost provider test passed."
+      },
+      "streamingProfile": {
+        "ttft": 5,
+        "tps": 1000,
+        "jitter": 0
+      }
+    }
+  ]
+}

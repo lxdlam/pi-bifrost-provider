@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createModels, type SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
 import {
 	bifrostHeaders,
 	configFromEnvironment,
@@ -8,7 +9,50 @@ import {
 	flagFromArgv,
 	normalizeBifrostUrl,
 	toProviderModel,
+	type BifrostConfig,
+	type BifrostProviderModel,
 } from "../index.ts";
+
+const TEST_MODE = process.env.BIFROST_TEST_MODE ?? "mock";
+const INTEGRATION_URL = process.env.BIFROST_TEST_URL;
+if (TEST_MODE !== "mock" && TEST_MODE !== "integration") {
+	throw new Error(`Unknown BIFROST_TEST_MODE: ${TEST_MODE}`);
+}
+if (TEST_MODE === "integration" && !INTEGRATION_URL) {
+	throw new Error("BIFROST_TEST_URL is required in integration mode");
+}
+const IS_INTEGRATION = TEST_MODE === "integration";
+const EXPECTED_MODEL_ID = "openai/gpt-4";
+const EXPECTED_RESPONSE = "Bifrost provider test passed.";
+
+function mockDiscoveryResponse(): Response {
+	return Response.json({
+		data: [
+			{
+				id: EXPECTED_MODEL_ID,
+				name: "GPT-4 Mock",
+				context_length: 8_192,
+				max_output_tokens: 4_096,
+				supported_methods: ["chat.completions"],
+			},
+		],
+	});
+}
+
+async function activeBackend(): Promise<{
+	config: BifrostConfig;
+	models: BifrostProviderModel[];
+}> {
+	if (IS_INTEGRATION) {
+		const config = { url: normalizeBifrostUrl(INTEGRATION_URL!) };
+		return { config, models: await fetchBifrostModels(config) };
+	}
+	const config = { url: "https://mock.bifrost.test/openai/v1" };
+	return {
+		config,
+		models: await fetchBifrostModels(config, { fetch: async () => mockDiscoveryResponse() }),
+	};
+}
 
 test("reads extension flags in both CLI forms", () => {
 	assert.equal(flagFromArgv("bifrost-url", ["--bifrost-url", "https://one.example"]), "https://one.example");
@@ -124,7 +168,15 @@ test("omits models that advertise only non-chat methods", () => {
 	assert.equal(toProviderModel({ id: "openai/text-embedding-3-small", supported_methods: ["embeddings"] }), undefined);
 });
 
-test("discovers models with both auth headers and de-duplicates IDs", async () => {
+test("discovers models from the active test backend", async () => {
+	const { models } = await activeBackend();
+	const model = models.find((candidate) => candidate.id === EXPECTED_MODEL_ID);
+	assert.ok(model, `${EXPECTED_MODEL_ID} was not returned by ${TEST_MODE} discovery`);
+	assert.ok(model.contextWindow > 0);
+	assert.ok(model.maxTokens > 0);
+});
+
+test("maps discovery responses, forwards headers, and de-duplicates IDs", async () => {
 	let requestedUrl: string | undefined;
 	let requestedHeaders: Headers | undefined;
 	const mockFetch: typeof fetch = async (input, init) => {
@@ -168,34 +220,39 @@ test("does not send an Authorization header for a keyless model-list request", a
 
 test("configures and persists the native provider through /login", async () => {
 	const requests: Array<{ url: string; headers: Headers }> = [];
+	const loginUrl = IS_INTEGRATION ? INTEGRATION_URL! : "https://login.example";
+	const virtualKey = IS_INTEGRATION ? "" : "sk-bf-login";
 	const mockFetch: typeof fetch = async (input, init) => {
 		requests.push({ url: String(input), headers: new Headers(init?.headers) });
-		return Response.json({ data: [{ id: "anthropic/claude-login-test", context_length: 200_000 }] });
+		return mockDiscoveryResponse();
 	};
-	const provider = createBifrostProvider({ fetch: mockFetch });
+	const provider = createBifrostProvider({ fetch: IS_INTEGRATION ? fetch : mockFetch });
 	const login = provider.auth.apiKey?.login;
 	assert.ok(login);
-	const answers = ["https://login.example", "", "sk-bf-login"];
+	const answers = [loginUrl, "", virtualKey];
 	const notifications: string[] = [];
 	const credential = await login({
 		signal: new AbortController().signal,
 		prompt: async () => answers.shift() ?? "",
 		notify: (event) => notifications.push(event.type),
 	});
+	const normalizedLoginUrl = normalizeBifrostUrl(loginUrl);
 
 	assert.deepEqual(credential, {
 		type: "api_key",
 		key: "pi-bifrost-keyless",
 		env: {
-			BIFROST_URL: "https://login.example/openai/v1",
-			BIFROST_VIRTUAL_KEY: "sk-bf-login",
+			BIFROST_URL: normalizedLoginUrl,
+			BIFROST_VIRTUAL_KEY: virtualKey,
 		},
 	});
-	assert.equal(requests[0]?.url, "https://login.example/openai/v1/models");
-	assert.equal(requests[0]?.headers.get("authorization"), null);
-	assert.equal(requests[0]?.headers.get("x-bf-vk"), "sk-bf-login");
+	if (!IS_INTEGRATION) {
+		assert.equal(requests[0]?.url, "https://login.example/openai/v1/models");
+		assert.equal(requests[0]?.headers.get("authorization"), null);
+		assert.equal(requests[0]?.headers.get("x-bf-vk"), "sk-bf-login");
+	}
 	assert.deepEqual(notifications, ["info", "progress"]);
-	assert.equal(provider.getModels()[0]?.id, "anthropic/claude-login-test");
+	assert.ok(provider.getModels().some((model) => model.id === EXPECTED_MODEL_ID));
 
 	let persistedModels: readonly unknown[] | undefined;
 	await provider.refreshModels?.({
@@ -208,16 +265,62 @@ test("configures and persists the native provider through /login", async () => {
 			return true;
 		},
 	});
-	assert.equal(persistedModels?.length, 1);
+	assert.ok(persistedModels?.length);
 
 	const resolved = await provider.auth.apiKey?.resolve({
 		credential,
 		signal: new AbortController().signal,
 		ctx: { env: async () => undefined, fileExists: async () => false },
 	});
-	assert.equal(resolved?.auth.baseUrl, "https://login.example/openai/v1");
+	assert.equal(resolved?.auth.baseUrl, normalizedLoginUrl);
 	assert.equal(resolved?.auth.headers?.Authorization, null);
-	assert.equal(resolved?.auth.headers?.["x-bf-vk"], "sk-bf-login");
+	assert.equal(resolved?.auth.headers?.["x-bf-vk"], virtualKey || undefined);
+});
+
+test("streams chat completions through the active test backend", async () => {
+	const { config, models: discovered } = await activeBackend();
+	const provider = createBifrostProvider({ config, models: discovered });
+	const models = createModels();
+	models.setProvider(provider);
+	const model = models.getModel("bifrost", EXPECTED_MODEL_ID);
+	assert.ok(model);
+
+	let requestedUrl: string | undefined;
+	const mockFetch: typeof fetch = async (input) => {
+		requestedUrl = String(input);
+		const body = [
+			`data: ${JSON.stringify({
+				id: "chatcmpl-test",
+				model: EXPECTED_MODEL_ID,
+				choices: [{ index: 0, delta: { role: "assistant", content: EXPECTED_RESPONSE }, finish_reason: null }],
+			})}`,
+			`data: ${JSON.stringify({
+				id: "chatcmpl-test",
+				model: EXPECTED_MODEL_ID,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				usage: { prompt_tokens: 4, completion_tokens: 5, total_tokens: 9 },
+			})}`,
+			"data: [DONE]",
+			"",
+		].join("\n\n");
+		return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+	};
+	const streamOptions: SimpleStreamOptions = { signal: AbortSignal.timeout(15_000) };
+	if (!IS_INTEGRATION) streamOptions.fetch = mockFetch;
+	const response = await models.completeSimple(
+		model,
+		{
+			messages: [{ role: "user", content: "pi bifrost provider test", timestamp: Date.now() }],
+		},
+		streamOptions,
+	);
+	const text = response.content
+		.filter((block) => block.type === "text")
+		.map((block) => block.text)
+		.join("");
+	assert.equal(text, EXPECTED_RESPONSE);
+	assert.equal(response.stopReason, "stop");
+	if (!IS_INTEGRATION) assert.equal(requestedUrl, "https://mock.bifrost.test/openai/v1/chat/completions");
 });
 
 test("keeps an unconfigured native provider available for /login", async () => {

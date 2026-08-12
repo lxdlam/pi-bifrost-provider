@@ -90,10 +90,76 @@ You can temporarily override `BIFROST_API_KEY` with pi's `--api-key` option. The
 
 The provider maps Bifrost's model-list response into pi model definitions, including context/output limits, text/image input support, reasoning efforts, and token pricing when Bifrost reports those fields. Models that advertise only non-chat methods (for example embeddings) are omitted.
 
+## Testing
+
+Both test modes run the same complete `*.test.ts` suite. Tests that exercise a backend select it from `BIFROST_TEST_MODE`; pure unit tests run unchanged in both modes.
+
+### Mock mode
+
+```bash
+npm test
+```
+
+The runner sets `BIFROST_TEST_MODE=mock`. Backend-aware discovery, login, and streaming scenarios use in-process `fetch` mocks, so no external processes or provider credentials are needed.
+
+### Integration mode
+
+```bash
+npm run test:integration
+```
+
+The runner performs the complete fixture lifecycle:
+
+1. Starts [aimock](https://github.com/CopilotKit/aimock) with `test/fixtures/aimock.json`.
+2. Writes a temporary, file-only Bifrost configuration that routes OpenAI requests to aimock.
+3. Starts Bifrost with `npx -y @maximhq/bifrost`.
+4. Runs the same full test suite with `BIFROST_TEST_MODE=integration` and `BIFROST_TEST_URL` set to the fixture.
+5. Stops both process trees and removes the temporary app directory, even when tests fail.
+
+This makes the backend-aware scenarios in `test/provider.test.ts` run through the real `Pi provider → Bifrost → aimock` path instead of a separate smoke test.
+
+The fixture uses available ephemeral ports by default. Its bind addresses, client-visible hosts, ports, packages, and startup behavior are configurable:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BIFROST_TEST_BIND_HOST` | `127.0.0.1` | Address passed to Bifrost's `-host`. |
+| `BIFROST_TEST_HOST` | bind host | Host used by tests to reach Bifrost. Useful when the bind address is `0.0.0.0` or the fixture is reached through another hostname. |
+| `BIFROST_TEST_PORT` | available ephemeral port | Bifrost listening port. |
+| `AIMOCK_TEST_BIND_HOST` | `127.0.0.1` | Address passed to aimock's `--host`. |
+| `AIMOCK_TEST_HOST` | bind host | Host written into Bifrost's upstream URL. |
+| `AIMOCK_TEST_PORT` | available ephemeral port | aimock listening port. |
+| `BIFROST_TEST_PACKAGE` | `@maximhq/bifrost` | Bifrost npm package specification, optionally pinned. |
+| `AIMOCK_TEST_PACKAGE` | `@copilotkit/aimock` | aimock npm package specification, optionally pinned. |
+| `BIFROST_TEST_START_TIMEOUT_MS` | `120000` | Readiness timeout for each fixture process. |
+| `BIFROST_TEST_VERBOSE` | unset | Set to `1` to print fixture process logs. |
+
+For example:
+
+```bash
+BIFROST_TEST_BIND_HOST=0.0.0.0 \
+BIFROST_TEST_HOST=127.0.0.1 \
+BIFROST_TEST_PORT=18080 \
+AIMOCK_TEST_PORT=14010 \
+BIFROST_TEST_PACKAGE=@maximhq/bifrost@1.6.3 \
+AIMOCK_TEST_PACKAGE=@copilotkit/aimock@1.38.0 \
+npm run test:integration
+```
+
+To keep the same managed fixture running for manual `/login bifrost` testing, use:
+
+```bash
+npm run fixture
+```
+
+The command prints its dynamically selected `BIFROST_TEST_URL` and keeps the fixture alive until Ctrl+C. A standalone zero-config Bifrost instance remains available with `npm run bifrost`.
+
+The first fixture run requires network access for `npx`; subsequent runs can reuse npm's cache.
+
 ## Development
 
 ```bash
 npm install
 npm run check
 npm test
+npm run test:integration
 ```
