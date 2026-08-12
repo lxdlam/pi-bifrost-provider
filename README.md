@@ -1,19 +1,33 @@
-# pi-bifrost-provider
+# Bifrost AI Gateway provider for pi
 
-A [pi](https://pi.dev) provider for [Bifrost](https://docs.getbifrost.ai/overview). It discovers models from Bifrost and sends requests through Bifrost's OpenAI Chat Completions integration.
+A [pi](https://pi.dev) provider for the [Bifrost AI Gateway](https://www.getmaxim.ai/bifrost). It discovers models from Bifrost and sends requests through Bifrost's OpenAI Chat Completions integration.
 
-## Setup
+## Installation
+
+Install the published package with pi:
+
+```bash
+pi install npm:pi-bifrost-provider
+```
+
+Use `pi install -l npm:pi-bifrost-provider` instead to install it only for the current project. You can also try the package for one session without installing it:
+
+```bash
+pi -e npm:pi-bifrost-provider
+```
+
+The package runs with your user's permissions. Review its source before installing it, as you would any pi extension.
 
 ## Usage
 
-At least one model provider must already be configured in Bifrost.
+A running Bifrost instance with at least one model provider configured is required.
 
 ### Interactive setup (recommended)
 
-Load the extension, then use Pi's standard login flow:
+Start pi after installing the package, then use pi's standard login flow:
 
 ```text
-pi -e ./index.ts
+pi
 /login bifrost
 ```
 
@@ -28,7 +42,7 @@ The connection is stored in Pi's credential store. Model discovery runs during l
 Then select a `bifrost/*` model with `/model`, or start directly with one:
 
 ```bash
-pi -e ./index.ts --provider bifrost --model 'anthropic/claude-*'
+pi --provider bifrost --model 'anthropic/claude-*'
 ```
 
 ### Manual setup
@@ -48,13 +62,13 @@ export BIFROST_URL=http://localhost:8080
 export BIFROST_API_KEY=your-api-key          # optional
 export BIFROST_VIRTUAL_KEY=sk-bf-...         # optional
 
-pi -e ./index.ts
+pi
 ```
 
 Or passing options directly:
 
 ```bash
-pi -e ./index.ts \
+pi \
   --bifrost-url http://localhost:8080 \
   --bifrost-api-key your-api-key \
   --bifrost-virtual-key sk-bf-...
@@ -94,6 +108,16 @@ Install dependencies and run the static checks:
 npm install
 npm run check
 ```
+
+### Running the extension locally
+
+From the repository root, load the TypeScript source directly instead of installing the published package:
+
+```bash
+pi -e ./index.ts
+```
+
+Use `/login bifrost` in that session to configure a connection, or provide the environment variables and CLI options documented above. Restart the command after editing `index.ts` to load your changes.
 
 ### Testing
 
