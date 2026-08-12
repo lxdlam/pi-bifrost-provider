@@ -1,0 +1,25 @@
+name: Integration
+
+# Daily canary against the latest published Bifrost release. The integration
+# suite starts a real gateway via `npx -y @maximhq/bifrost` (always latest),
+# so a failing run here with a green CI usually means a Bifrost update broke
+# the provider, not a change in this repo.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Record Bifrost version under test
+        run: npm view @maximhq/bifrost version
+      - run: npm run test:integration

@@ -14,6 +14,12 @@ export const PROVIDER_ID = "bifrost";
 const PLACEHOLDER_API_KEY = "pi-bifrost-keyless";
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 8_192;
+/**
+ * Placeholder baseUrl for models registered without a config (e.g. before
+ * /login runs). It is never actually requested: resolve()'s auth.baseUrl
+ * overrides it before any request is made.
+ */
+const UNRESOLVED_BASE_URL = "http://localhost/openai/v1";
 
 export interface BifrostConfig {
 	/** Bifrost instance URL or an OpenAI-compatible Bifrost base URL. */
@@ -88,7 +94,12 @@ function nonEmpty(value: string | undefined): string | undefined {
 	return trimmed ? trimmed : undefined;
 }
 
-/** Extension CLI values are applied after factories run, so startup-time model discovery reads argv directly. */
+/**
+ * Extension CLI values are applied after factories run, so startup-time model
+ * discovery reads argv directly. In the space-separated form (`--name value`),
+ * a value beginning with `--` is treated as the next flag and ignored; use
+ * `--name=value` to pass such a value.
+ */
 export function flagFromArgv(name: string, argv: readonly string[] = process.argv.slice(2)): string | undefined {
 	const flag = `--${name}`;
 	let result: string | undefined;
@@ -135,6 +146,11 @@ export function normalizeBifrostUrl(value: string): string {
 	return parsed.toString().replace(/\/$/u, "");
 }
 
+/**
+ * Build a {@link BifrostConfig} from environment variables and explicit
+ * overrides (overrides win). Returns `undefined` when no URL is available
+ * from either source, rather than throwing.
+ */
 export function optionalConfigFromEnvironment(
 	env: NodeJS.ProcessEnv = process.env,
 	overrides: Partial<BifrostConfig> = {},
@@ -148,6 +164,10 @@ export function optionalConfigFromEnvironment(
 	};
 }
 
+/**
+ * Same as {@link optionalConfigFromEnvironment}, but throws when no
+ * BIFROST_URL / --bifrost-url is configured instead of returning `undefined`.
+ */
 export function configFromEnvironment(
 	env: NodeJS.ProcessEnv = process.env,
 	overrides: Partial<BifrostConfig> = {},
@@ -168,7 +188,17 @@ function setHeader(headers: ProviderHeaders, name: string, value: string | null)
 	headers[name] = value;
 }
 
-/** Build request headers while allowing explicit per-request headers to win. */
+/**
+ * Build request headers while allowing explicit per-request headers to win.
+ *
+ * A header value of `null` (for example Authorization when `config.apiKey`
+ * is unset) actively suppresses pi's default header for that name — notably
+ * the default Authorization pi would otherwise send — whereas simply
+ * omitting the key from the result leaves pi's default in place. Callers
+ * that issue raw fetches (not routed through pi) must filter out `null`
+ * entries themselves before using this as a Headers/fetch init object, as
+ * {@link fetchBifrostModels} does.
+ */
 export function bifrostHeaders(config: BifrostConfig, overrides?: ProviderHeaders): ProviderHeaders {
 	const headers: ProviderHeaders = { Accept: "application/json" };
 	setHeader(headers, "Authorization", config.apiKey ? `Bearer ${config.apiKey}` : null);
@@ -184,7 +214,15 @@ function positiveInteger(...values: unknown[]): number | undefined {
 	return undefined;
 }
 
-/** Bifrost/OpenRouter pricing is normally expressed in dollars per token. */
+/**
+ * Bifrost/OpenRouter pricing is normally expressed in dollars per token.
+ * Heuristic: values <= 0.01 are assumed to be per-token and are scaled by
+ * 1,000,000 to get dollars per million tokens; values above that threshold
+ * are assumed to already be per-million. This is ambiguous for genuine
+ * per-million prices at or below $0.01 (e.g. very cheap models), which get
+ * misread as per-token and inflated by 1,000,000x. There is no reliable way
+ * to disambiguate from the number alone, so the threshold is a best guess.
+ */
 function pricePerMillion(value: string | number | undefined): number | undefined {
 	if (value === undefined || value === "") return undefined;
 	const parsed = typeof value === "number" ? value : Number.parseFloat(value);
@@ -213,6 +251,20 @@ function thinkingLevelMap(model: BifrostModel): ThinkingLevelMap | undefined {
 	};
 }
 
+/**
+ * Convert a Bifrost catalog entry into pi's provider model shape, or
+ * `undefined` if the model has no id or is not chat-capable.
+ *
+ * `contextWindow` falls back through `model.context_length`,
+ * `top_provider.context_length`, `max_input_tokens + max_output_tokens`, and
+ * finally `per_request_limits.prompt_tokens` — the last of which is a
+ * stand-in (a per-request cap), not a true context window. `maxTokens`
+ * falls back similarly through `max_output_tokens`,
+ * `top_provider.max_completion_tokens`, and
+ * `per_request_limits.completion_tokens`. When none of a chain's sources are
+ * available, `contextWindow`/`maxTokens` default to
+ * {@link DEFAULT_CONTEXT_WINDOW} (128k) / {@link DEFAULT_MAX_TOKENS} (8k).
+ */
 export function toProviderModel(model: BifrostModel): BifrostProviderModel | undefined {
 	const id = nonEmpty(model.id);
 	if (!id || !isChatModel(model)) return undefined;
@@ -221,9 +273,7 @@ export function toProviderModel(model: BifrostModel): BifrostProviderModel | und
 		positiveInteger(
 			model.context_length,
 			model.top_provider?.context_length,
-			model.max_input_tokens && model.max_output_tokens
-				? model.max_input_tokens + model.max_output_tokens
-				: undefined,
+			model.max_input_tokens && model.max_output_tokens ? model.max_input_tokens + model.max_output_tokens : undefined,
 			model.per_request_limits?.prompt_tokens,
 		) ?? DEFAULT_CONTEXT_WINDOW;
 	const maxTokens = Math.min(
@@ -250,10 +300,18 @@ export function toProviderModel(model: BifrostModel): BifrostProviderModel | und
 			input: inputPrice,
 			output: outputPrice,
 			cacheRead: pricePerMillion(model.pricing?.input_cache_read) ?? inputPrice,
+			// Falling back to the input price when Bifrost omits cache-write
+			// pricing underestimates providers that bill cache writes above
+			// input (e.g. 1.25x on Anthropic). This is a deliberate
+			// conservative default, not a true price.
 			cacheWrite: pricePerMillion(model.pricing?.input_cache_write) ?? inputPrice,
 		},
 		contextWindow,
 		maxTokens,
+		// These OpenAI-compatibility flags are asserted for every model on the
+		// assumption that Bifrost's OpenAI-compatible translation layer
+		// normalizes them across upstream providers. This trusts the gateway
+		// rather than verifying per-model support.
 		compat: {
 			supportsDeveloperRole: true,
 			supportsReasoningEffort: reasoning,
@@ -273,6 +331,11 @@ function errorMessage(body: unknown): string | undefined {
 	return undefined;
 }
 
+/**
+ * Fetch and normalize the model catalog from a Bifrost instance's
+ * `/models` endpoint. Throws on a non-OK response, an invalid response
+ * shape, or an empty resulting catalog (deduplicated by id).
+ */
 export async function fetchBifrostModels(
 	config: BifrostConfig,
 	options: { fetch?: Fetch; signal?: AbortSignal } = {},
@@ -299,9 +362,7 @@ export async function fetchBifrostModels(
 	const data = (body as BifrostModelResponse | undefined)?.data;
 	if (!Array.isArray(data)) throw new Error("Bifrost model discovery returned an invalid response (expected data[])");
 
-	const models = data
-		.map(toProviderModel)
-		.filter((model): model is BifrostProviderModel => model !== undefined);
+	const models = data.map(toProviderModel).filter((model): model is BifrostProviderModel => model !== undefined);
 	const uniqueModels = [...new Map(models.map((model) => [model.id, model])).values()];
 	if (uniqueModels.length === 0) {
 		throw new Error("Bifrost did not return any chat-completion models");
@@ -328,12 +389,13 @@ function credentialConfig(
 	const url = credentialUrl ?? fallback?.url;
 	if (!url) return undefined;
 
+	// "Owning" means the credential carries its own URL (from a prior
+	// /login), so ambient fallbacks (env/argv config) must not leak into it.
 	const ownsConfig = credentialUrl !== undefined;
 	const key = nonEmpty(credential?.key);
 	const apiKey = key && key !== PLACEHOLDER_API_KEY ? key : ownsConfig ? undefined : fallback?.apiKey;
-	const virtualKey = ownsConfig
-		? nonEmpty(credential?.env?.BIFROST_VIRTUAL_KEY)
-		: nonEmpty(credential?.env?.BIFROST_VIRTUAL_KEY) ?? fallback?.virtualKey;
+	const credentialVirtualKey = nonEmpty(credential?.env?.BIFROST_VIRTUAL_KEY);
+	const virtualKey = ownsConfig ? credentialVirtualKey : (credentialVirtualKey ?? fallback?.virtualKey);
 	return { url: normalizeBifrostUrl(url), apiKey, virtualKey };
 }
 
@@ -360,9 +422,13 @@ export interface CreateBifrostProviderOptions {
 export function createBifrostProvider(options: CreateBifrostProviderOptions = {}): Provider<"openai-completions"> {
 	const fetchImpl = options.fetch ?? globalThis.fetch;
 	let ambientConfig = options.config;
-	const catalog = runtimeModels(options.models ?? [], ambientConfig?.url ?? "http://localhost/openai/v1");
+	const catalog = runtimeModels(options.models ?? [], ambientConfig?.url ?? UNRESOLVED_BASE_URL);
 	let pendingModels = catalog.length > 0 ? [...catalog] : undefined;
 
+	// createProvider() below captures this `catalog` array by reference, so
+	// updates must mutate it in place. Reassigning `catalog` to a new array
+	// here would silently break model refresh (the provider would keep
+	// pointing at the stale array).
 	const replaceCatalog = (models: readonly BifrostRuntimeModel[]): void => {
 		catalog.splice(0, catalog.length, ...models);
 	};
@@ -385,8 +451,7 @@ export function createBifrostProvider(options: CreateBifrostProviderOptions = {}
 
 		if (context.stored) {
 			const restored = context.stored.models.filter(
-				(model): model is BifrostRuntimeModel =>
-					model.provider === PROVIDER_ID && model.api === "openai-completions",
+				(model): model is BifrostRuntimeModel => model.provider === PROVIDER_ID && model.api === "openai-completions",
 			);
 			if (!(await context.publish({ update: () => replaceCatalog(restored) }))) return;
 		}
@@ -503,9 +568,22 @@ export default async function bifrostProvider(pi: ExtensionAPI): Promise<void> {
 		apiKey: flag("bifrost-api-key"),
 		virtualKey: flag("bifrost-virtual-key"),
 	});
-	const models = config
-		? await fetchBifrostModels(config, { signal: AbortSignal.timeout(15_000) })
-		: undefined;
+	// Startup discovery is best-effort: a temporarily-down Bifrost must not
+	// prevent the extension from loading. If it fails here, the provider is
+	// still registered with `models: undefined`; refreshModels() (using
+	// /login-persisted models or a later successful fetch) retries recovery.
+	let models: BifrostProviderModel[] | undefined;
+	if (config) {
+		try {
+			models = await fetchBifrostModels(config, { signal: AbortSignal.timeout(15_000) });
+		} catch (error) {
+			process.stderr.write(
+				`pi-bifrost-provider: startup model discovery failed, continuing without a preloaded catalog: ${
+					error instanceof Error ? error.message : String(error)
+				}\n`,
+			);
+		}
+	}
 
 	pi.registerProvider(createBifrostProvider({ config, models }));
 }

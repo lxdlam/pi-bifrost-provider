@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createModels, type SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
 import {
+	type BifrostConfig,
+	type BifrostProviderModel,
 	bifrostHeaders,
 	configFromEnvironment,
 	createBifrostProvider,
@@ -9,8 +11,6 @@ import {
 	flagFromArgv,
 	normalizeBifrostUrl,
 	toProviderModel,
-	type BifrostConfig,
-	type BifrostProviderModel,
 } from "../index.ts";
 
 const TEST_MODE = process.env.BIFROST_TEST_MODE ?? "mock";

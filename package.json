@@ -10,6 +10,15 @@
     "llm-gateway"
   ],
   "license": "MIT",
+  "author": "lxdlam <lxdlam@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lxdlam/pi-bifrost-provider.git"
+  },
+  "homepage": "https://github.com/lxdlam/pi-bifrost-provider#readme",
+  "bugs": {
+    "url": "https://github.com/lxdlam/pi-bifrost-provider/issues"
+  },
   "files": [
     "index.ts",
     "README.md",
@@ -23,11 +32,12 @@
   "scripts": {
     "bifrost": "npx -y @maximhq/bifrost",
     "fixture": "tsx test/run-tests.ts --fixture",
-    "check": "tsc --noEmit",
+    "check": "biome check . && tsc --noEmit",
     "test": "tsx test/run-tests.ts",
     "test:integration": "tsx test/run-tests.ts --integration"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.8",
     "@earendil-works/pi-ai": "^0.84.1",
     "@earendil-works/pi-coding-agent": "^0.84.1",
     "@types/node": "^22.0.0",
