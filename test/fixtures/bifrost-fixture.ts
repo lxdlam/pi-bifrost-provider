@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -175,7 +175,6 @@ export class BifrostTestFixture {
 		const fixture = new BifrostTestFixture(bifrost.url, aimock.url, appDir, children);
 
 		try {
-			await mkdir(appDir, { recursive: true });
 			await writeFile(
 				join(appDir, "config.json"),
 				JSON.stringify(
