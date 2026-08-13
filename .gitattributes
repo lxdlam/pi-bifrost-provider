@@ -1,0 +1,4 @@
+# Normalize all text files to LF in the repository and on checkout.
+# Without this, core.autocrlf=true on Windows checks files out as CRLF and
+# Biome's LF-only formatting makes `npm run check` fail locally.
+* text=auto eol=lf
