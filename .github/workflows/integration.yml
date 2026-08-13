@@ -1,10 +1,17 @@
 name: Integration
 
-# Daily canary against the latest published Bifrost release. The integration
-# suite starts a real gateway via `npx -y @maximhq/bifrost` (always latest),
-# so a failing run here with a green CI usually means a Bifrost update broke
-# the provider, not a change in this repo.
+# Integration gate on pull requests and master merges plus a daily canary
+# against the latest published Bifrost release. The suite starts a real
+# gateway via `npx -y @maximhq/bifrost` (always latest): running it on every
+# PR keeps merge failures from surfacing only after a squash lands on
+# master, the master push re-verifies the merged tree end-to-end, and the
+# scheduled run catches upstream Bifrost changes that break the provider (a
+# red canary with a green CI usually means an upstream change, not a change
+# in this repo).
 on:
+  push:
+    branches: [master]
+  pull_request:
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
