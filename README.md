@@ -100,6 +100,27 @@ You can temporarily override `BIFROST_API_KEY` with Pi's `--api-key` option. The
 
 The provider maps Bifrost's model-list response into Pi model definitions, including context/output limits, text/image input support, reasoning efforts, and token pricing when Bifrost reports those fields. Models that advertise only non-chat methods (for example, embeddings) are omitted.
 
+Bifrost often returns only `id`, `object`, `owned_by`, and `created` — for OpenAI-compatible providers it drops upstream metadata such as `context_length` and `max_output_tokens` ([maximhq/bifrost#4301](https://github.com/maximhq/bifrost/pull/4301) tracks preserving it). Without those fields a model would be registered with Pi's conservative 128k/8k defaults, so the provider fills the gaps from the [models.dev](https://models.dev) catalog:
+
+- Bifrost values always win when present; the catalog only replaces the fallback defaults.
+- Lookups strip the gateway prefix, so `CommandCode/claude-opus-5-5` matches `claude-opus-5-5`, and ignore `:free` tags and `-YYYYMMDD` suffixes.
+- The catalog is fetched at most once a day and cached under `~/.cache/pi-bifrost-provider/models-dev.json`. An unreachable catalog falls back to a stale cache and then to the defaults, and never fails discovery.
+- Models that end up on the defaults anyway are reported once per session through Pi's notification UI, with a pointer to `modelOverrides`.
+
+To pin exact limits for one model, override them in `~/.pi/agent/models.json`; the provider is not involved in that path:
+
+```json
+{
+  "providers": {
+    "bifrost": {
+      "modelOverrides": {
+        "CommandCode/claude-opus-5-5": { "contextWindow": 1000000, "maxTokens": 128000 }
+      }
+    }
+  }
+}
+```
+
 ## Developing
 
 Install dependencies and run the static checks:

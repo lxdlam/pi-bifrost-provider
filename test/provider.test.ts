@@ -1,15 +1,22 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { createModels, type SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
 import {
 	type BifrostConfig,
 	type BifrostProviderModel,
 	bifrostHeaders,
+	buildMetadataIndex,
 	configFromEnvironment,
 	createBifrostProvider,
 	fetchBifrostModels,
 	flagFromArgv,
+	loadMetadataIndex,
+	metadataFor,
 	normalizeBifrostUrl,
+	normalizeModelKey,
 	toProviderModel,
 } from "../index.ts";
 
@@ -214,7 +221,7 @@ test("does not send an Authorization header for a keyless model-list request", a
 		return Response.json({ data: [{ id: "ollama/qwen3" }] });
 	};
 
-	await fetchBifrostModels({ url: "http://localhost:8080/openai/v1" }, { fetch: mockFetch });
+	await fetchBifrostModels({ url: "http://localhost:8080/openai/v1" }, { fetch: mockFetch, metadata: null });
 	assert.equal(requestedHeaders?.has("authorization"), false);
 });
 
@@ -349,4 +356,149 @@ test("surfaces Bifrost model discovery errors", async () => {
 		fetchBifrostModels({ url: "https://example.com/openai/v1" }, { fetch: mockFetch }),
 		/Bifrost model discovery failed \(403\): virtual key is invalid/u,
 	);
+});
+
+/** Shape-compatible subset of models.dev `api.json`. */
+const CATALOG = {
+	anthropic: { models: { "claude-opus-5-5": { limit: { context: 1_000_000, output: 128_000 } } } },
+	// A gateway that clips the window must not win over the two providers that agree.
+	openrouter: { models: { "claude-opus-5-5": { limit: { context: 200_000, output: 64_000 } } } },
+	deepseek: { models: { "deepseek-v4.1-flash": { limit: { context: 1_000_000 } } } },
+};
+
+const DISCOVERY_URL = "https://bifrost.example/openai/v1";
+const OPUS_MODEL = "CommandCode/claude-opus-5-5";
+
+async function tempCachePath(): Promise<string> {
+	return join(await mkdtemp(join(tmpdir(), "pi-bifrost-metadata-")), "models-dev.json");
+}
+
+function discoveryFetch(entries: unknown[]): typeof fetch {
+	return async () => Response.json({ data: entries });
+}
+
+const offlineFetch: typeof fetch = async () => {
+	throw new Error("offline");
+};
+
+test("normalizes catalog keys across Bifrost prefixes, tags, and dates", () => {
+	assert.equal(normalizeModelKey(" CommandCode/Claude-Opus-5-5 "), "commandcode/claude-opus-5-5");
+	assert.equal(normalizeModelKey("poolside/laguna-s-2.1:free"), "poolside/laguna-s-2.1");
+	assert.equal(normalizeModelKey("claude-opus-4-5-20251101"), "claude-opus-4-5");
+});
+
+test("takes the most-reported window, not whichever provider comes first", () => {
+	const majority = buildMetadataIndex({
+		abacus: { models: { "gpt-5.4": { limit: { context: 400_000, output: 128_000 } } } },
+		azure: { models: { "gpt-5.4": { limit: { context: 1_050_000, output: 128_000 } } } },
+		"302ai": { models: { "gpt-5.4": { limit: { context: 1_050_000, output: 64_000 } } } },
+		freemodel: { models: { "gpt-5.4": { limit: { context: 1_050_000, output: 32_000 } } } },
+		// 2-2 on the window: the tie must resolve to the larger one.
+		other: { models: { "tie-model": { limit: { context: 1_048_576 } } } },
+		third: { models: { "tie-model": { limit: { context: 262_144 } } } },
+		// One provider spells the id with a vendor prefix and claims a 1M output cap; the twelve
+		// behind the bare spelling say 512k, and both spellings must vote in one bucket.
+		minimax: { models: { "minimax-m3": { limit: { context: 1_048_576, output: 512_000 } } } },
+		"minimax-cn": { models: { "minimax-m3": { limit: { context: 1_048_576, output: 512_000 } } } },
+		"outlier-host": { models: { "minimaxai/minimax-m3": { limit: { context: 1_048_576, output: 1_048_576 } } } },
+	});
+	assert.deepEqual(metadataFor(majority, "gpt-5.4"), { contextWindow: 1_050_000, maxTokens: 128_000 });
+	assert.deepEqual(metadataFor(majority, "tie-model"), { contextWindow: 1_048_576, maxTokens: undefined });
+	assert.deepEqual(metadataFor(majority, "minimax-m3"), { contextWindow: 1_048_576, maxTokens: 512_000 });
+	assert.deepEqual(metadataFor(majority, "CommandCode/MiniMaxAI/MiniMax-M3"), {
+		contextWindow: 1_048_576,
+		maxTokens: 512_000,
+	});
+});
+
+test("resolves limits through gateway and vendor path segments", () => {
+	const index = buildMetadataIndex(CATALOG);
+	assert.deepEqual(metadataFor(index, OPUS_MODEL), { contextWindow: 1_000_000, maxTokens: 128_000 });
+	assert.deepEqual(metadataFor(index, "deepseek/deepseek-v4.1-flash"), {
+		contextWindow: 1_000_000,
+		maxTokens: undefined,
+	});
+	assert.equal(metadataFor(index, "CommandCode/unknown-model"), undefined);
+	assert.equal(metadataFor(undefined, OPUS_MODEL), undefined);
+	assert.equal(buildMetadataIndex(undefined).size, 0);
+	assert.equal(buildMetadataIndex({ broken: { models: "not-an-object" } }).size, 0);
+});
+
+test("prefers Bifrost limits and fills only the ones it omits", () => {
+	const metadata = metadataFor(buildMetadataIndex(CATALOG), OPUS_MODEL);
+	const declared = toProviderModel({ id: OPUS_MODEL, context_length: 200_000, max_output_tokens: 8_192 }, metadata);
+	assert.equal(declared?.contextWindow, 200_000);
+	assert.equal(declared?.maxTokens, 8_192);
+
+	const partial = toProviderModel({ id: OPUS_MODEL, context_length: 300_000 }, metadata);
+	assert.equal(partial?.contextWindow, 300_000);
+	assert.equal(partial?.maxTokens, 128_000);
+
+	const filled = toProviderModel({ id: OPUS_MODEL }, metadata);
+	assert.equal(filled?.contextWindow, 1_000_000);
+	assert.equal(filled?.maxTokens, 128_000);
+
+	const unfilled = toProviderModel({ id: OPUS_MODEL });
+	assert.equal(unfilled?.contextWindow, 128_000);
+	assert.equal(unfilled?.maxTokens, 8_192);
+});
+
+test("caches the catalog on disk and reuses it without network access", async () => {
+	const cachePath = await tempCachePath();
+	let calls = 0;
+	const fetchImpl: typeof fetch = async () => {
+		calls += 1;
+		return Response.json(CATALOG);
+	};
+	const first = await loadMetadataIndex({ fetch: fetchImpl, cachePath });
+	assert.equal(calls, 1);
+	assert.deepEqual(metadataFor(first, OPUS_MODEL), { contextWindow: 1_000_000, maxTokens: 128_000 });
+	assert.match(await readFile(cachePath, "utf8"), /claude-opus-5-5/u);
+
+	const cached = await loadMetadataIndex({ fetch: offlineFetch, cachePath });
+	assert.deepEqual(metadataFor(cached, OPUS_MODEL), { contextWindow: 1_000_000, maxTokens: 128_000 });
+});
+
+test("falls back to a stale cache and tolerates a missing one", async () => {
+	const cachePath = await tempCachePath();
+	await loadMetadataIndex({ fetch: async () => Response.json(CATALOG), cachePath });
+	const stale = await loadMetadataIndex({
+		fetch: offlineFetch,
+		cachePath,
+		now: Date.now() + 7 * 24 * 60 * 60 * 1_000,
+	});
+	assert.deepEqual(metadataFor(stale, "claude-opus-5-5"), { contextWindow: 1_000_000, maxTokens: 128_000 });
+	assert.equal(await loadMetadataIndex({ fetch: offlineFetch, cachePath: await tempCachePath() }), undefined);
+});
+
+test("fills discovery results from the fallback catalog", async () => {
+	const options = { fetch: discoveryFetch([{ id: OPUS_MODEL }]) };
+	const filled = await fetchBifrostModels(
+		{ url: DISCOVERY_URL },
+		{ ...options, metadata: buildMetadataIndex(CATALOG) },
+	);
+	assert.equal(filled[0]?.contextWindow, 1_000_000);
+	assert.equal(filled[0]?.maxTokens, 128_000);
+
+	const unfilled = await fetchBifrostModels({ url: DISCOVERY_URL }, { ...options, metadata: null });
+	assert.equal(unfilled[0]?.contextWindow, 128_000);
+	assert.equal(unfilled[0]?.maxTokens, 8_192);
+});
+
+test("reports models left on the default limits through the notice sink", async () => {
+	const notices: Array<{ message: string; type?: string }> = [];
+	const notify = (message: string, type?: "info" | "warning" | "error") => notices.push({ message, type });
+	const options = { fetch: discoveryFetch([{ id: "CommandCode/unknown-model" }]), metadata: null, notify };
+
+	await fetchBifrostModels({ url: DISCOVERY_URL }, options);
+	assert.equal(notices.length, 1);
+	assert.equal(notices[0]?.type, "warning");
+	assert.match(notices[0]?.message ?? "", /CommandCode\/unknown-model/u);
+
+	// Announced once per id per process, so refresh loops stay quiet.
+	await fetchBifrostModels({ url: DISCOVERY_URL }, options);
+	assert.equal(notices.length, 1);
+
+	// A provider used without a sink (SDK, headless) stays silent.
+	assert.doesNotThrow(() => fetchBifrostModels({ url: DISCOVERY_URL }, { ...options, notify: undefined }));
 });

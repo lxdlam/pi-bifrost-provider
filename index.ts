@@ -1,3 +1,6 @@
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import {
 	type ApiKeyCredential,
 	createProvider,
@@ -8,12 +11,17 @@ import {
 	type RefreshModelsContext,
 	type ThinkingLevelMap,
 } from "@earendil-works/pi-ai/compat";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 export const PROVIDER_ID = "bifrost";
 const PLACEHOLDER_API_KEY = "pi-bifrost-keyless";
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 8_192;
+/** Fallback model catalog, used when Bifrost reports no context/output limits. */
+const METADATA_URL = "https://models.dev/api.json";
+const METADATA_CACHE_TTL_MS = 24 * 60 * 60 * 1_000;
+const METADATA_TIMEOUT_MS = 10_000;
+const METADATA_CACHE_PATH = join(homedir(), ".cache", "pi-bifrost-provider", "models-dev.json");
 /**
  * Placeholder baseUrl for models registered without a config (e.g. before
  * /login runs). It is never actually requested: resolve()'s auth.baseUrl
@@ -223,6 +231,199 @@ function positiveInteger(...values: unknown[]): number | undefined {
  * misread as per-token and inflated by 1,000,000x. There is no reliable way
  * to disambiguate from the number alone, so the threshold is a best guess.
  */
+/** Context and output limits for one model, in tokens. */
+export interface ModelMetadata {
+	contextWindow?: number;
+	maxTokens?: number;
+}
+
+/** Lookup keyed by {@link normalizeModelKey}. */
+export type ModelMetadataIndex = Map<string, ModelMetadata>;
+
+/**
+ * Normalize a model id for cross-catalog comparison: lower-case, without a
+ * `:free`-style tag or an `-YYYYMMDD` release-date suffix.
+ */
+export function normalizeModelKey(id: string): string {
+	return id
+		.trim()
+		.toLowerCase()
+		.replace(/:[a-z0-9._-]+$/u, "")
+		.replace(/-\d{8}$/u, "");
+}
+
+/**
+ * Bucket key for a registry id: the last path segment, tag- and date-normalized.
+ *
+ * Gateways spell the same model differently (`minimax-m3`, `minimaxai/minimax-m3`,
+ * `CommandCode/MiniMaxAI/MiniMax-M3`) and each spelling is its own registry entry. Keying by
+ * spelling lets a lone provider outvote the twelve behind another spelling, so every variant
+ * votes in one bucket.
+ */
+export function modelKey(id: string): string {
+	const segments = normalizeModelKey(id).split("/");
+	return segments[segments.length - 1] ?? "";
+}
+
+/** Resolve limits for a Bifrost model id, or `undefined` when unknown. */
+export function metadataFor(index: ModelMetadataIndex | undefined, modelId: string): ModelMetadata | undefined {
+	if (!index) return undefined;
+	return index.get(modelKey(modelId));
+}
+
+/**
+ * Build a lookup from a models.dev `api.json` document, or from any object
+ * shaped `{ provider: { models: { id: { limit: { context, output } } } } }`.
+ * The first provider to define a model id wins: catalogs repeat the same
+ * limits across gateways, and a stable choice beats a clever one.
+ */
+/**
+ * Build a lookup from a models.dev `api.json` document, or from any object
+ * shaped `{ provider: { models: { id: { limit: { context, output } } } } }`.
+ *
+ * Catalogs list the same model once per gateway, and gateways report different
+ * limits: a router that clips a window reports less than the model's own vendor
+ * (gpt-5.4: one provider 400k, eight 1.05M; kimi-k3: mostly 1M+, one 262k).
+ * Taking the first provider to define an id therefore reports whichever gateway
+ * happens to come first — an under-report, which Pi answers by compacting
+ * needlessly early. The majority value wins instead, for both the window and
+ * the output cap, and ties go to the larger value (limits are clipped far more
+ * often than they are inflated).
+ */
+export function buildMetadataIndex(catalog: unknown): ModelMetadataIndex {
+	const candidates = new Map<string, ModelMetadata[]>();
+	if (!catalog || typeof catalog !== "object") return new Map();
+	for (const provider of Object.values(catalog as Record<string, unknown>)) {
+		const models = (provider as { models?: Record<string, unknown> } | undefined)?.models;
+		if (!models || typeof models !== "object") continue;
+		for (const [id, entry] of Object.entries(models)) {
+			const limit = (entry as { limit?: { context?: unknown; output?: unknown } } | undefined)?.limit;
+			const contextWindow = positiveInteger(limit?.context);
+			const maxTokens = positiveInteger(limit?.output);
+			if (contextWindow === undefined && maxTokens === undefined) continue;
+			const key = modelKey(id);
+			if (!key) continue;
+			const existing = candidates.get(key);
+			if (existing) existing.push({ contextWindow, maxTokens });
+			else candidates.set(key, [{ contextWindow, maxTokens }]);
+		}
+	}
+
+	const index: ModelMetadataIndex = new Map();
+	for (const [key, entries] of candidates) {
+		const contextWindow = majorityValue(entries.map((entry) => entry.contextWindow));
+		if (contextWindow === undefined) {
+			index.set(key, { maxTokens: majorityValue(entries.map((entry) => entry.maxTokens)) });
+			continue;
+		}
+		// Output caps belong to the window they were reported with; mixing them across windows would
+		// let a bigger window's cap through.
+		const maxTokens = majorityValue(
+			entries.filter((entry) => entry.contextWindow === contextWindow).map((entry) => entry.maxTokens),
+		);
+		index.set(key, { contextWindow, maxTokens });
+	}
+	return index;
+}
+
+/** Most-reported value, ties to the larger one. */
+function majorityValue(values: readonly (number | undefined)[]): number | undefined {
+	const votes = new Map<number, number>();
+	for (const value of values) {
+		if (value === undefined) continue;
+		votes.set(value, (votes.get(value) ?? 0) + 1);
+	}
+	let winner: number | undefined;
+	for (const [value, count] of votes) {
+		if (winner === undefined) {
+			winner = value;
+			continue;
+		}
+		const winnerCount = votes.get(winner) ?? 0;
+		if (count > winnerCount || (count === winnerCount && value > winner)) winner = value;
+	}
+	return winner;
+}
+
+function isFresh(checkedAt: unknown, now: number): boolean {
+	return typeof checkedAt === "number" && now >= checkedAt && now - checkedAt < METADATA_CACHE_TTL_MS;
+}
+
+/**
+ * Load the fallback catalog, preferring a fresh on-disk cache over a network
+ * fetch. Never throws: discovery must survive an unreachable catalog, and a
+ * stale cache beats no metadata at all.
+ *
+ * The `fetch` option is deliberately separate from the Bifrost discovery
+ * fetch, so a caller that injects an HTTP mock for Bifrost does not route
+ * catalog requests through it.
+ */
+export async function loadMetadataIndex(
+	options: { fetch?: Fetch; signal?: AbortSignal; cachePath?: string; now?: number } = {},
+): Promise<ModelMetadataIndex | undefined> {
+	const cachePath = options.cachePath ?? METADATA_CACHE_PATH;
+	const now = options.now ?? Date.now();
+	let cached: { checkedAt?: unknown; catalog?: unknown } | undefined;
+	try {
+		cached = JSON.parse(await readFile(cachePath, "utf8")) as { checkedAt?: unknown; catalog?: unknown };
+	} catch {
+		cached = undefined;
+	}
+	if (cached && isFresh(cached.checkedAt, now)) {
+		const fresh = buildMetadataIndex(cached.catalog);
+		if (fresh.size > 0) return fresh;
+	}
+
+	let catalog: unknown;
+	try {
+		const timeout = AbortSignal.timeout(METADATA_TIMEOUT_MS);
+		const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+		const response = await (options.fetch ?? globalThis.fetch)(METADATA_URL, { signal });
+		if (!response.ok) throw new Error(`model catalog responded ${response.status}`);
+		catalog = await response.json();
+	} catch {
+		const stale = buildMetadataIndex(cached?.catalog);
+		return stale.size > 0 ? stale : undefined;
+	}
+
+	const index = buildMetadataIndex(catalog);
+	if (index.size === 0) return undefined;
+	try {
+		await mkdir(dirname(cachePath), { recursive: true });
+		await writeFile(cachePath, JSON.stringify({ checkedAt: now, catalog }));
+	} catch {
+		// An unwritable cache must not fail discovery; the index is still usable.
+	}
+	return index;
+}
+
+/**
+ * User-facing notice sink. Wired to Pi's notification UI by the extension
+ * entry point; a provider used directly (SDK, tests) stays silent unless it
+ * passes one.
+ */
+export type DiscoveryNotifier = (message: string, type?: "info" | "warning" | "error") => void;
+
+/**
+ * Announce models left on {@link DEFAULT_CONTEXT_WINDOW} because neither
+ * Bifrost nor the fallback catalog knew their limits. Announced once per id
+ * per process so refresh loops stay quiet.
+ */
+const announcedMissingContext = new Set<string>();
+function announceMissingContext(ids: readonly string[], notify: DiscoveryNotifier | undefined): void {
+	if (!notify) return;
+	const unannounced = ids.filter((id) => !announcedMissingContext.has(id));
+	if (unannounced.length === 0) return;
+	for (const id of unannounced) announcedMissingContext.add(id);
+	const preview = `${unannounced.slice(0, 5).join(", ")}${unannounced.length > 5 ? ", ..." : ""}`;
+	// Written to the terminal it would overwrite Pi's prompt; the notice sink
+	// is the only channel that renders safely while the TUI owns the screen.
+	notify(
+		`Bifrost reported no context window for ${unannounced.length} model(s): ${preview}. Assuming ${DEFAULT_CONTEXT_WINDOW} tokens; pin exact values with providers.bifrost.modelOverrides in models.json.`,
+		"warning",
+	);
+}
+
 function pricePerMillion(value: string | number | undefined): number | undefined {
 	if (value === undefined || value === "") return undefined;
 	const parsed = typeof value === "number" ? value : Number.parseFloat(value);
@@ -251,39 +452,46 @@ function thinkingLevelMap(model: BifrostModel): ThinkingLevelMap | undefined {
 	};
 }
 
+/** Context window as declared by Bifrost, if any field carries one. */
+function declaredContextWindow(model: BifrostModel): number | undefined {
+	return positiveInteger(
+		model.context_length,
+		model.top_provider?.context_length,
+		model.max_input_tokens && model.max_output_tokens ? model.max_input_tokens + model.max_output_tokens : undefined,
+		model.per_request_limits?.prompt_tokens,
+	);
+}
+
+/** Output cap as declared by Bifrost, if any field carries one. */
+function declaredMaxTokens(model: BifrostModel): number | undefined {
+	return positiveInteger(
+		model.max_output_tokens,
+		model.top_provider?.max_completion_tokens,
+		model.per_request_limits?.completion_tokens,
+	);
+}
+
 /**
  * Convert a Bifrost catalog entry into pi's provider model shape, or
  * `undefined` if the model has no id or is not chat-capable.
  *
- * `contextWindow` falls back through `model.context_length`,
+ * `contextWindow` and `maxTokens` come from `model.context_length`,
  * `top_provider.context_length`, `max_input_tokens + max_output_tokens`, and
- * finally `per_request_limits.prompt_tokens` — the last of which is a
- * stand-in (a per-request cap), not a true context window. `maxTokens`
- * falls back similarly through `max_output_tokens`,
- * `top_provider.max_completion_tokens`, and
- * `per_request_limits.completion_tokens`. When none of a chain's sources are
- * available, `contextWindow`/`maxTokens` default to
- * {@link DEFAULT_CONTEXT_WINDOW} (128k) / {@link DEFAULT_MAX_TOKENS} (8k).
+ * `per_request_limits.prompt_tokens` (a per-request cap, not a true context
+ * window), plus the matching `max_output_tokens` /
+ * `top_provider.max_completion_tokens` /
+ * `per_request_limits.completion_tokens` chain. Bifrost reports none of these
+ * for a large part of its catalog, so `metadata` (see
+ * {@link loadMetadataIndex}) supplies the missing limits before falling back
+ * to {@link DEFAULT_CONTEXT_WINDOW} (128k) / {@link DEFAULT_MAX_TOKENS} (8k).
+ * Bifrost's own values always win when present.
  */
-export function toProviderModel(model: BifrostModel): BifrostProviderModel | undefined {
+export function toProviderModel(model: BifrostModel, metadata?: ModelMetadata): BifrostProviderModel | undefined {
 	const id = nonEmpty(model.id);
 	if (!id || !isChatModel(model)) return undefined;
 
-	const contextWindow =
-		positiveInteger(
-			model.context_length,
-			model.top_provider?.context_length,
-			model.max_input_tokens && model.max_output_tokens ? model.max_input_tokens + model.max_output_tokens : undefined,
-			model.per_request_limits?.prompt_tokens,
-		) ?? DEFAULT_CONTEXT_WINDOW;
-	const maxTokens = Math.min(
-		contextWindow,
-		positiveInteger(
-			model.max_output_tokens,
-			model.top_provider?.max_completion_tokens,
-			model.per_request_limits?.completion_tokens,
-		) ?? DEFAULT_MAX_TOKENS,
-	);
+	const contextWindow = declaredContextWindow(model) ?? metadata?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+	const maxTokens = Math.min(contextWindow, declaredMaxTokens(model) ?? metadata?.maxTokens ?? DEFAULT_MAX_TOKENS);
 	const parameters = model.supported_parameters?.map((parameter) => parameter.toLowerCase()) ?? [];
 	const reasoning = model.reasoning !== undefined || parameters.some((parameter) => parameter.includes("reasoning"));
 	const inputModalities = model.architecture?.input_modalities?.map((modality) => modality.toLowerCase()) ?? [];
@@ -335,10 +543,18 @@ function errorMessage(body: unknown): string | undefined {
  * Fetch and normalize the model catalog from a Bifrost instance's
  * `/models` endpoint. Throws on a non-OK response, an invalid response
  * shape, or an empty resulting catalog (deduplicated by id).
+ *
+ * Models whose limits Bifrost does not report are filled in from `metadata`
+ * (see {@link loadMetadataIndex}) unless `metadata: null` disables the lookup.
  */
 export async function fetchBifrostModels(
 	config: BifrostConfig,
-	options: { fetch?: Fetch; signal?: AbortSignal } = {},
+	options: {
+		fetch?: Fetch;
+		signal?: AbortSignal;
+		metadata?: ModelMetadataIndex | null;
+		notify?: DiscoveryNotifier;
+	} = {},
 ): Promise<BifrostProviderModel[]> {
 	const fetchImpl = options.fetch ?? globalThis.fetch;
 	const requestHeaders = Object.fromEntries(
@@ -362,11 +578,27 @@ export async function fetchBifrostModels(
 	const data = (body as BifrostModelResponse | undefined)?.data;
 	if (!Array.isArray(data)) throw new Error("Bifrost model discovery returned an invalid response (expected data[])");
 
-	const models = data.map(toProviderModel).filter((model): model is BifrostProviderModel => model !== undefined);
+	const chatModels = data.filter(isChatModel);
+	const missingLimits = (entry: BifrostModel): boolean =>
+		declaredContextWindow(entry) === undefined && declaredMaxTokens(entry) === undefined;
+	let metadata: ModelMetadataIndex | undefined;
+	if (options.metadata !== null && chatModels.some(missingLimits)) {
+		metadata = options.metadata ?? (await loadMetadataIndex({ signal: options.signal }));
+	}
+	const models = data
+		.map((entry) => toProviderModel(entry, metadataFor(metadata, entry.id ?? "")))
+		.filter((model): model is BifrostProviderModel => model !== undefined);
 	const uniqueModels = [...new Map(models.map((model) => [model.id, model])).values()];
 	if (uniqueModels.length === 0) {
 		throw new Error("Bifrost did not return any chat-completion models");
 	}
+	announceMissingContext(
+		chatModels
+			.filter((entry) => missingLimits(entry) && metadataFor(metadata, entry.id ?? "") === undefined)
+			.map((entry) => entry.id)
+			.filter((id): id is string => id !== undefined),
+		options.notify,
+	);
 	return uniqueModels;
 }
 
@@ -416,6 +648,8 @@ export interface CreateBifrostProviderOptions {
 	config?: BifrostConfig;
 	models?: readonly BifrostProviderModel[];
 	fetch?: Fetch;
+	/** Where discovery notices go; see {@link DiscoveryNotifier}. */
+	notify?: DiscoveryNotifier;
 }
 
 /** Create the native provider used by Pi, including its /login setup flow. */
@@ -463,7 +697,7 @@ export function createBifrostProvider(options: CreateBifrostProviderOptions = {}
 		);
 		if (!config) return;
 		const discovered = runtimeModels(
-			await fetchBifrostModels(config, { fetch: fetchImpl, signal: context.signal }),
+			await fetchBifrostModels(config, { fetch: fetchImpl, signal: context.signal, notify: options.notify }),
 			config.url,
 		);
 		await context.publish({
@@ -509,6 +743,9 @@ export function createBifrostProvider(options: CreateBifrostProviderOptions = {}
 					);
 					const config = { url, apiKey, virtualKey };
 					interaction.notify({ type: "progress", message: "Discovering Bifrost models..." });
+					// Deliberately no `notify`: the login dialog reports the flow, and a
+					// limits notice here would land mid-prompt. Discovery without a
+					// sink stays silent; the next refresh reports it.
 					const discovered = runtimeModels(
 						await fetchBifrostModels(config, { fetch: fetchImpl, signal: interaction.signal }),
 						url,
@@ -571,6 +808,28 @@ export default async function bifrostProvider(pi: ExtensionAPI): Promise<void> {
 		apiKey: flag("bifrost-api-key"),
 		virtualKey: flag("bifrost-virtual-key"),
 	});
+	// Notices must never be written straight to stderr: Pi's TUI owns the
+	// terminal and a raw write lands on the prompt line. The UI context only
+	// arrives with the first event, so notices are queued until then and
+	// flushed on session start; text output gets them when there is no TUI.
+	let ui: ExtensionContext["ui"] | undefined;
+	const queuedNotices: Array<{ message: string; type?: "info" | "warning" | "error" }> = [];
+	const notify: DiscoveryNotifier = (message, type) => {
+		if (ui) {
+			ui.notify(message, type);
+			return;
+		}
+		if (!process.stdout.isTTY) {
+			process.stderr.write(`pi-bifrost-provider: ${message}\n`);
+			return;
+		}
+		queuedNotices.push({ message, type });
+	};
+	pi.on("session_start", (_event, ctx) => {
+		ui = ctx.ui;
+		for (const notice of queuedNotices.splice(0)) ctx.ui.notify(notice.message, notice.type);
+	});
+
 	// Startup discovery is best-effort: a temporarily-down Bifrost must not
 	// prevent the extension from loading. If it fails here, the provider is
 	// still registered with `models: undefined`; refreshModels() (using
@@ -578,15 +837,12 @@ export default async function bifrostProvider(pi: ExtensionAPI): Promise<void> {
 	let models: BifrostProviderModel[] | undefined;
 	if (config) {
 		try {
-			models = await fetchBifrostModels(config, { signal: AbortSignal.timeout(15_000) });
+			models = await fetchBifrostModels(config, { signal: AbortSignal.timeout(15_000), notify });
 		} catch (error) {
-			process.stderr.write(
-				`pi-bifrost-provider: startup model discovery failed, continuing without a preloaded catalog: ${
-					error instanceof Error ? error.message : String(error)
-				}\n`,
-			);
+			const detail = error instanceof Error ? error.message : String(error);
+			notify(`startup model discovery failed, continuing without a preloaded catalog: ${detail}`, "error");
 		}
 	}
 
-	pi.registerProvider(createBifrostProvider({ config, models }));
+	pi.registerProvider(createBifrostProvider({ config, models, notify }));
 }
