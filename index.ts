@@ -92,6 +92,9 @@ export interface BifrostProviderModel {
 		supportsUsageInStreaming: true;
 		supportsStrictMode: true;
 		maxTokensField: "max_completion_tokens";
+		/** Stable per-conversation id for Bifrost session affinity and harness routing. */
+		sendSessionAffinityHeaders: true;
+		sessionAffinityFormat: "openrouter";
 	};
 }
 
@@ -526,6 +529,10 @@ export function toProviderModel(model: BifrostModel, metadata?: ModelMetadata): 
 			supportsUsageInStreaming: true,
 			supportsStrictMode: true,
 			maxTokensField: "max_completion_tokens",
+			// Bifrost adopts harness session headers (x-session-id, x-session-affinity, …)
+			// for stickiness, governance routing, and gateway plugins (e.g. OpenCode bridge).
+			sendSessionAffinityHeaders: true,
+			sessionAffinityFormat: "openrouter",
 		},
 	};
 }

@@ -121,6 +121,26 @@ To pin exact limits for one model, override them in `~/.pi/agent/models.json`; t
 }
 ```
 
+### Session affinity
+
+Discovered models enable Pi's OpenAI-completions session affinity headers (`sendSessionAffinityHeaders` with OpenRouter-style `x-session-id`). Pi sends the agent's stable conversation `sessionId` on every request in that chat so [Bifrost session affinity](https://docs.getbifrost.ai/providers/session-affinity) and gateway plugins can route follow-up turns consistently (for example OpenCode Go via `x-opencode-session`).
+
+To use OpenAI-style headers instead (`x-session-affinity`, `x-client-request-id`, `session_id`), override compat in `models.json`:
+
+```json
+{
+  "providers": {
+    "bifrost": {
+      "compat": {
+        "sessionAffinityFormat": "openai"
+      }
+    }
+  }
+}
+```
+
+You can also send `x-bf-session-id` explicitly via per-request headers if your client supports it; that always wins on the gateway.
+
 ## Developing
 
 Install dependencies and run the static checks:

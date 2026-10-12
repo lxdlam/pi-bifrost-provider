@@ -169,6 +169,8 @@ test("maps Bifrost model metadata into a pi model", () => {
 		xhigh: null,
 		max: null,
 	});
+	assert.equal(model.compat.sendSessionAffinityHeaders, true);
+	assert.equal(model.compat.sessionAffinityFormat, "openrouter");
 });
 
 test("omits models that advertise only non-chat methods", () => {
