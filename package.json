@@ -32,6 +32,7 @@
   "scripts": {
     "bifrost": "npx -y @maximhq/bifrost",
     "fixture": "tsx test/run-tests.ts --fixture",
+    "release": "tsx scripts/release.ts",
     "check": "biome check . && tsc --noEmit",
     "test": "tsx test/run-tests.ts",
     "test:integration": "tsx test/run-tests.ts --integration"
