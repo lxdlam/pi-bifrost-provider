@@ -1,16 +1,25 @@
 name: Release
 
+# Releases happen only after a release PR lands on the default branch. Pushing a
+# v* tag (which `npm run release` does while the PR is still open) must never
+# publish anything by itself, so this workflow deliberately has no tag trigger.
 on:
   push:
-    tags: ["v*"]
+    branches: [master]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
 
 jobs:
-  publish:
+  release:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -18,17 +27,63 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
-      - run: npm ci
-      - run: npm run check
-      - run: npm test
-      - name: Verify tag matches package version
+
+      - name: Detect pending release
+        id: pending
         shell: bash
         run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          package_version="$(node -p "require('./package.json').version")"
-          if [[ "$tag_version" != "$package_version" ]]; then
-            echo "Tag version $tag_version does not match package version $package_version" >&2
-            exit 1
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          tag="v$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          # The tag is the release request: a merged version bump without one is not released.
+          rc=0
+          refs="$(git ls-remote --exit-code origin "refs/tags/$tag" "refs/tags/$tag^{}")" || rc=$?
+          if [[ $rc -eq 2 ]]; then
+            echo "::notice::No $tag tag for package version $version; nothing to release."
+            exit 0
+          elif [[ $rc -ne 0 ]]; then
+            echo "Could not query tags from origin" >&2
+            exit "$rc"
           fi
+          echo "tag_sha=$(tail -n 1 <<<"$refs" | cut -f 1)" >> "$GITHUB_OUTPUT"
+
+          if [[ "$(npm view "$name@$version" version 2>/dev/null || true)" == "$version" ]]; then
+            echo "$name@$version is already on npm."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "GitHub release $tag already exists."
+          else
+            echo "github_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.pending.outputs.publish == 'true'
+        run: npm ci
+      - if: steps.pending.outputs.publish == 'true'
+        run: npm run check
+      - if: steps.pending.outputs.publish == 'true'
+        run: npm test
+
+      # The tag was created on the PR branch, so after a squash merge or review
+      # fixups it does not point at the commit being published. Retarget it so
+      # the tag, the GitHub release and the npm package all describe one commit.
+      - name: Point tag at the merged commit
+        if: steps.pending.outputs.publish == 'true' && steps.pending.outputs.tag_sha != github.sha
+        run: >
+          gh api --method PATCH
+          "repos/$GITHUB_REPOSITORY/git/refs/tags/${{ steps.pending.outputs.tag }}"
+          -f sha="$GITHUB_SHA" -F force=true --silent
+
       - name: Publish package with npm trusted publishing
+        if: steps.pending.outputs.publish == 'true'
         run: npm publish --access public
+
+      - name: Create GitHub release
+        if: steps.pending.outputs.github_release == 'true'
+        run: >
+          gh release create "${{ steps.pending.outputs.tag }}"
+          --verify-tag --title "${{ steps.pending.outputs.tag }}" --generate-notes
