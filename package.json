@@ -1,6 +1,6 @@
 {
   "name": "pi-bifrost-provider",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "A Bifrost AI Gateway provider for the pi coding agent",
   "type": "module",
   "keywords": [
