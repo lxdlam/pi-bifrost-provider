@@ -3,7 +3,7 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createModels, type SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
+import { createModels, type SimpleStreamOptions, type StreamOptions } from "@earendil-works/pi-ai/compat";
 import {
 	BIFROST_SESSION_HEADER,
 	type BifrostConfig,
@@ -18,6 +18,7 @@ import {
 	metadataFor,
 	normalizeBifrostUrl,
 	normalizeModelKey,
+	SESSION_AFFINITY_HEADER,
 	toProviderModel,
 	withBifrostSessionHeader,
 } from "../index.ts";
@@ -136,23 +137,35 @@ test("builds independent API authentication and governance headers", () => {
 	);
 });
 
-test("attaches x-bf-session-id from sessionId without overriding explicit headers", () => {
+test("attaches session headers from sessionId without overriding explicit headers", () => {
+	const both = (value: string) => ({ [BIFROST_SESSION_HEADER]: value, [SESSION_AFFINITY_HEADER]: value });
 	assert.equal(withBifrostSessionHeader(undefined), undefined);
-	assert.deepEqual(withBifrostSessionHeader({ sessionId: "   " }), { sessionId: "   " });
+	assert.deepEqual(withBifrostSessionHeader({ headers: { a: "b" } }), { headers: { a: "b" } });
+	// A blank ID is dropped so the adapter cannot send it as a header or prompt_cache_key.
+	assert.deepEqual(withBifrostSessionHeader({ sessionId: "   " }), { sessionId: undefined });
 	assert.deepEqual(withBifrostSessionHeader({ sessionId: "session-123" }), {
 		sessionId: "session-123",
-		headers: { [BIFROST_SESSION_HEADER]: "session-123" },
+		headers: both("session-123"),
 	});
-	assert.deepEqual(
-		withBifrostSessionHeader({
-			sessionId: "session-123",
-			headers: { "X-BF-Session-Id": "custom-session" },
-		}),
-		{
-			sessionId: "session-123",
-			headers: { "X-BF-Session-Id": "custom-session" },
-		},
-	);
+	assert.deepEqual(withBifrostSessionHeader({ sessionId: "  session-123  " }), {
+		sessionId: "session-123",
+		headers: both("session-123"),
+	});
+	// Header keys are matched case-insensitively, a null value is the suppression
+	// sentinel that keeps the caller's choice in place, and sessionId is still
+	// normalized when the caller supplies its own header.
+	for (const value of ["custom-session", null]) {
+		assert.deepEqual(
+			withBifrostSessionHeader({
+				sessionId: "  session-123  ",
+				headers: { "X-BF-Session-Id": value, "X-Session-Id": value },
+			}),
+			{
+				sessionId: "session-123",
+				headers: { "X-BF-Session-Id": value, "X-Session-Id": value },
+			},
+		);
+	}
 });
 
 test("maps Bifrost model metadata into a pi model", () => {
@@ -313,6 +326,26 @@ test("configures and persists the native provider through /login", async () => {
 	assert.equal(resolved?.auth.headers?.["x-bf-vk"], virtualKey || undefined);
 });
 
+/** OpenAI-compatible SSE body carrying `EXPECTED_RESPONSE` in one text delta. */
+function completionsSseResponse(): Response {
+	const body = [
+		`data: ${JSON.stringify({
+			id: "chatcmpl-test",
+			model: EXPECTED_MODEL_ID,
+			choices: [{ index: 0, delta: { role: "assistant", content: EXPECTED_RESPONSE }, finish_reason: null }],
+		})}`,
+		`data: ${JSON.stringify({
+			id: "chatcmpl-test",
+			model: EXPECTED_MODEL_ID,
+			choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			usage: { prompt_tokens: 4, completion_tokens: 5, total_tokens: 9 },
+		})}`,
+		"data: [DONE]",
+		"",
+	].join("\n\n");
+	return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
 test("streams chat completions through the active test backend", async () => {
 	const { config, models: discovered } = await activeBackend();
 	const provider = createBifrostProvider({ config, models: discovered });
@@ -326,26 +359,14 @@ test("streams chat completions through the active test backend", async () => {
 	const mockFetch: typeof fetch = async (input, init) => {
 		requestedUrl = String(input);
 		requestedHeaders = new Headers(init?.headers);
-		const body = [
-			`data: ${JSON.stringify({
-				id: "chatcmpl-test",
-				model: EXPECTED_MODEL_ID,
-				choices: [{ index: 0, delta: { role: "assistant", content: EXPECTED_RESPONSE }, finish_reason: null }],
-			})}`,
-			`data: ${JSON.stringify({
-				id: "chatcmpl-test",
-				model: EXPECTED_MODEL_ID,
-				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-				usage: { prompt_tokens: 4, completion_tokens: 5, total_tokens: 9 },
-			})}`,
-			"data: [DONE]",
-			"",
-		].join("\n\n");
-		return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+		return completionsSseResponse();
 	};
+	// Cache retention "none" makes the adapter skip its own affinity headers;
+	// the provider must still send both session headers.
 	const streamOptions: SimpleStreamOptions = {
 		signal: AbortSignal.timeout(15_000),
 		sessionId: "test-session-id",
+		cacheRetention: "none",
 	};
 	if (!IS_INTEGRATION) streamOptions.fetch = mockFetch;
 	const response = await models.completeSimple(
@@ -364,7 +385,44 @@ test("streams chat completions through the active test backend", async () => {
 	if (!IS_INTEGRATION) {
 		assert.equal(requestedUrl, "https://mock.bifrost.test/openai/v1/chat/completions");
 		assert.equal(requestedHeaders?.get(BIFROST_SESSION_HEADER), "test-session-id");
-		assert.equal(requestedHeaders?.get("x-session-id"), "test-session-id");
+		assert.equal(requestedHeaders?.get(SESSION_AFFINITY_HEADER), "test-session-id");
+	}
+});
+
+test("sends one normalized session ID on the typed stream path", async () => {
+	const { config, models: discovered } = await activeBackend();
+	const provider = createBifrostProvider({ config, models: discovered });
+	const models = createModels();
+	models.setProvider(provider);
+	const model = models.getModel("bifrost", EXPECTED_MODEL_ID);
+	assert.ok(model);
+
+	let requestedHeaders: Headers | undefined;
+	let requestedBody: { prompt_cache_key?: string } | undefined;
+	const mockFetch: typeof fetch = async (_input, init) => {
+		requestedHeaders = new Headers(init?.headers);
+		requestedBody = JSON.parse(String(init?.body));
+		return completionsSseResponse();
+	};
+	// Long retention makes the adapter send sessionId as prompt_cache_key too.
+	const options: StreamOptions = {
+		signal: AbortSignal.timeout(15_000),
+		sessionId: "  stream-session-id  ",
+		cacheRetention: "long",
+	};
+	if (!IS_INTEGRATION) options.fetch = mockFetch;
+	const response = await models.complete(
+		model,
+		{
+			messages: [{ role: "user", content: "pi bifrost provider test", timestamp: Date.now() }],
+		},
+		options,
+	);
+	assert.equal(response.stopReason, "stop");
+	if (!IS_INTEGRATION) {
+		assert.equal(requestedHeaders?.get(BIFROST_SESSION_HEADER), "stream-session-id");
+		assert.equal(requestedHeaders?.get(SESSION_AFFINITY_HEADER), "stream-session-id");
+		assert.equal(requestedBody?.prompt_cache_key, "stream-session-id");
 	}
 });
 

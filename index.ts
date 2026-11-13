@@ -16,6 +16,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 export const PROVIDER_ID = "bifrost";
 export const BIFROST_SESSION_HEADER = "x-bf-session-id";
+/** Generic session header Bifrost v2.0.0+ falls back to without `x-bf-session-id`. */
+export const SESSION_AFFINITY_HEADER = "x-session-id";
 const PLACEHOLDER_API_KEY = "pi-bifrost-keyless";
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 8_192;
@@ -225,20 +227,28 @@ function hasHeader(headers: ProviderHeaders | undefined, name: string): boolean 
 }
 
 /**
- * Attach `options.sessionId` as `x-bf-session-id` when the caller has not
- * already supplied that header. Bifrost prioritizes `x-bf-session-id` when
- * grouping multi-turn harness logs and routing session-sticky requests.
+ * Attach `options.sessionId` as `x-bf-session-id` and `x-session-id`, leaving
+ * any header the caller already supplied (including a `null` suppression) in
+ * place. Bifrost prioritizes `x-bf-session-id` when grouping multi-turn harness
+ * logs and routing session-sticky requests.
+ *
+ * `x-session-id` is set here rather than left to the adapter's
+ * `sendSessionAffinityHeaders` compat path, which skips it when cache retention
+ * is `"none"`. `sessionId` is normalized unconditionally (trimmed, or removed
+ * when blank) because the adapter also uses it as `prompt_cache_key`, which
+ * must match the session headers.
  */
 export function withBifrostSessionHeader<T extends { sessionId?: string; headers?: ProviderHeaders }>(
 	options: T | undefined,
 ): T | undefined {
-	if (!options) return options;
+	if (options?.sessionId === undefined) return options;
 	const sessionId = nonEmpty(options.sessionId);
-	if (!sessionId || hasHeader(options.headers, BIFROST_SESSION_HEADER)) return options;
-	return {
-		...options,
-		headers: { ...options.headers, [BIFROST_SESSION_HEADER]: sessionId },
-	};
+	if (!sessionId) return { ...options, sessionId: undefined };
+	const headers: ProviderHeaders = { ...options.headers };
+	for (const name of [BIFROST_SESSION_HEADER, SESSION_AFFINITY_HEADER]) {
+		if (!hasHeader(headers, name)) headers[name] = sessionId;
+	}
+	return { ...options, sessionId, headers };
 }
 
 function bifrostCompletionsApi(): ProviderStreams {
