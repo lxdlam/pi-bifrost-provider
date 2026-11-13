@@ -63,4 +63,5 @@ These are documented inline in `index.ts` — read the comment at the site befor
 ## CI
 
 - `ci.yml`: check + mock tests on every push/PR.
+- `release.yml`: runs on pushes to `master` only. `npm run release -- x.y.z` opens a release PR and pushes the `vx.y.z` tag, but the tag alone releases nothing; once the PR is merged, the workflow publishes to npm and creates the GitHub release if the `package.json` version has a tag and is not yet published. Don't add a tag trigger — that publishes unreviewed PR commits.
 - `integration.yml`: daily canary (03:00 UTC) against the **latest published** `@maximhq/bifrost`. A red canary with green CI means an upstream Bifrost change broke the provider — fix the provider or pin/report upstream; don't silence the workflow.

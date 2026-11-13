@@ -53,7 +53,7 @@ export function release(version: string, root = ROOT, run: Run = runCommand): vo
 			"--title",
 			`chore: release ${tag}`,
 			"--body",
-			`Bump the package version to ${version} and regenerate package-lock.json with npm.\n\nTag: ${tag}.`,
+			`Bump the package version to ${version} and regenerate package-lock.json with npm.\n\nTag: ${tag}. Merging this PR into ${base} publishes ${version} to npm and creates the GitHub release; nothing is released before then.`,
 		],
 		root,
 	).trim();
