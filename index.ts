@@ -8,12 +8,14 @@ import {
 	openAICompletionsApi,
 	type Provider,
 	type ProviderHeaders,
+	type ProviderStreams,
 	type RefreshModelsContext,
 	type ThinkingLevelMap,
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 export const PROVIDER_ID = "bifrost";
+export const BIFROST_SESSION_HEADER = "x-bf-session-id";
 const PLACEHOLDER_API_KEY = "pi-bifrost-keyless";
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 8_192;
@@ -92,6 +94,8 @@ export interface BifrostProviderModel {
 		supportsUsageInStreaming: true;
 		supportsStrictMode: true;
 		maxTokensField: "max_completion_tokens";
+		sendSessionAffinityHeaders: true;
+		sessionAffinityFormat: "openrouter";
 	};
 }
 
@@ -213,6 +217,37 @@ export function bifrostHeaders(config: BifrostConfig, overrides?: ProviderHeader
 	if (config.virtualKey) setHeader(headers, "x-bf-vk", config.virtualKey);
 	for (const [name, value] of Object.entries(overrides ?? {})) setHeader(headers, name, value);
 	return headers;
+}
+
+function hasHeader(headers: ProviderHeaders | undefined, name: string): boolean {
+	const expected = name.toLowerCase();
+	return Object.keys(headers ?? {}).some((key) => key.toLowerCase() === expected);
+}
+
+/**
+ * Attach `options.sessionId` as `x-bf-session-id` when the caller has not
+ * already supplied that header. Bifrost prioritizes `x-bf-session-id` when
+ * grouping multi-turn harness logs and routing session-sticky requests.
+ */
+export function withBifrostSessionHeader<T extends { sessionId?: string; headers?: ProviderHeaders }>(
+	options: T | undefined,
+): T | undefined {
+	if (!options) return options;
+	const sessionId = nonEmpty(options.sessionId);
+	if (!sessionId || hasHeader(options.headers, BIFROST_SESSION_HEADER)) return options;
+	return {
+		...options,
+		headers: { ...options.headers, [BIFROST_SESSION_HEADER]: sessionId },
+	};
+}
+
+function bifrostCompletionsApi(): ProviderStreams {
+	const streams = openAICompletionsApi();
+	return {
+		...streams,
+		stream: (model, context, options) => streams.stream(model, context, withBifrostSessionHeader(options)),
+		streamSimple: (model, context, options) => streams.streamSimple(model, context, withBifrostSessionHeader(options)),
+	};
 }
 
 function positiveInteger(...values: unknown[]): number | undefined {
@@ -526,6 +561,8 @@ export function toProviderModel(model: BifrostModel, metadata?: ModelMetadata): 
 			supportsUsageInStreaming: true,
 			supportsStrictMode: true,
 			maxTokensField: "max_completion_tokens",
+			sendSessionAffinityHeaders: true,
+			sessionAffinityFormat: "openrouter",
 		},
 	};
 }
@@ -779,7 +816,7 @@ export function createBifrostProvider(options: CreateBifrostProviderOptions = {}
 			},
 		},
 		models: catalog,
-		api: openAICompletionsApi(),
+		api: bifrostCompletionsApi(),
 	});
 
 	return { ...base, refreshModels };

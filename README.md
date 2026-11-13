@@ -96,6 +96,13 @@ If `BIFROST_URL` already ends in `/v1` (for example, `http://localhost:8080/v1`)
 
 You can temporarily override `BIFROST_API_KEY` with Pi's `--api-key` option. The virtual key still comes from `BIFROST_VIRTUAL_KEY`.
 
+### Session headers and log grouping
+
+Pi passes the active conversation's `sessionId` on every turn. The provider forwards it to Bifrost in two ways so multi-turn conversations are grouped in Bifrost logs and sticky-routed across upstream providers:
+
+- **`x-bf-session-id`** — attached directly on every chat completion request when `options.sessionId` is present (unless the caller already supplied `x-bf-session-id`).
+- **`x-session-id`** — enabled via `compat.sendSessionAffinityHeaders: true` (`sessionAffinityFormat: "openrouter"`) on discovered models.
+
 ### Model metadata
 
 The provider maps Bifrost's model-list response into Pi model definitions, including context/output limits, text/image input support, reasoning efforts, and token pricing when Bifrost reports those fields. Models that advertise only non-chat methods (for example, embeddings) are omitted.

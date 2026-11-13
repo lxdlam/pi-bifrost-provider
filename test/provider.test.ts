@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { createModels, type SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
 import {
+	BIFROST_SESSION_HEADER,
 	type BifrostConfig,
 	type BifrostProviderModel,
 	bifrostHeaders,
@@ -18,6 +19,7 @@ import {
 	normalizeBifrostUrl,
 	normalizeModelKey,
 	toProviderModel,
+	withBifrostSessionHeader,
 } from "../index.ts";
 
 const TEST_MODE = process.env.BIFROST_TEST_MODE ?? "mock";
@@ -134,6 +136,25 @@ test("builds independent API authentication and governance headers", () => {
 	);
 });
 
+test("attaches x-bf-session-id from sessionId without overriding explicit headers", () => {
+	assert.equal(withBifrostSessionHeader(undefined), undefined);
+	assert.deepEqual(withBifrostSessionHeader({ sessionId: "   " }), { sessionId: "   " });
+	assert.deepEqual(withBifrostSessionHeader({ sessionId: "session-123" }), {
+		sessionId: "session-123",
+		headers: { [BIFROST_SESSION_HEADER]: "session-123" },
+	});
+	assert.deepEqual(
+		withBifrostSessionHeader({
+			sessionId: "session-123",
+			headers: { "X-BF-Session-Id": "custom-session" },
+		}),
+		{
+			sessionId: "session-123",
+			headers: { "X-BF-Session-Id": "custom-session" },
+		},
+	);
+});
+
 test("maps Bifrost model metadata into a pi model", () => {
 	const model = toProviderModel({
 		id: "anthropic/claude-sonnet-4-6",
@@ -169,6 +190,8 @@ test("maps Bifrost model metadata into a pi model", () => {
 		xhigh: null,
 		max: null,
 	});
+	assert.equal(model.compat.sendSessionAffinityHeaders, true);
+	assert.equal(model.compat.sessionAffinityFormat, "openrouter");
 });
 
 test("omits models that advertise only non-chat methods", () => {
@@ -299,8 +322,10 @@ test("streams chat completions through the active test backend", async () => {
 	assert.ok(model);
 
 	let requestedUrl: string | undefined;
-	const mockFetch: typeof fetch = async (input) => {
+	let requestedHeaders: Headers | undefined;
+	const mockFetch: typeof fetch = async (input, init) => {
 		requestedUrl = String(input);
+		requestedHeaders = new Headers(init?.headers);
 		const body = [
 			`data: ${JSON.stringify({
 				id: "chatcmpl-test",
@@ -318,7 +343,10 @@ test("streams chat completions through the active test backend", async () => {
 		].join("\n\n");
 		return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
 	};
-	const streamOptions: SimpleStreamOptions = { signal: AbortSignal.timeout(15_000) };
+	const streamOptions: SimpleStreamOptions = {
+		signal: AbortSignal.timeout(15_000),
+		sessionId: "test-session-id",
+	};
 	if (!IS_INTEGRATION) streamOptions.fetch = mockFetch;
 	const response = await models.completeSimple(
 		model,
@@ -333,7 +361,11 @@ test("streams chat completions through the active test backend", async () => {
 		.join("");
 	assert.equal(text, EXPECTED_RESPONSE);
 	assert.equal(response.stopReason, "stop");
-	if (!IS_INTEGRATION) assert.equal(requestedUrl, "https://mock.bifrost.test/openai/v1/chat/completions");
+	if (!IS_INTEGRATION) {
+		assert.equal(requestedUrl, "https://mock.bifrost.test/openai/v1/chat/completions");
+		assert.equal(requestedHeaders?.get(BIFROST_SESSION_HEADER), "test-session-id");
+		assert.equal(requestedHeaders?.get("x-session-id"), "test-session-id");
+	}
 });
 
 test("keeps an unconfigured native provider available for /login", async () => {
