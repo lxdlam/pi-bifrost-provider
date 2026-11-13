@@ -218,6 +218,23 @@ npm run bifrost
 
 The first fixture run requires network access for `npx`; subsequent runs can reuse npm's cache.
 
+### Releasing
+
+With a clean working tree, an `origin` remote, and an authenticated [GitHub CLI](https://cli.github.com/):
+
+```bash
+npm run release -- 0.3.0
+```
+
+The script accepts `x.y.z` (no `v` prefix), tags the current commit as `vx.y.z`, updates `package.json` and `package-lock.json`, then runs:
+
+```bash
+git push origin refs/tags/v0.3.0
+gh release create v0.3.0 --verify-tag --generate-notes
+```
+
+The version bump is left **uncommitted** and is not included in the tagged commit. Review and commit it separately. The script stops on failure without rolling back completed steps; if a push or release fails, fix the cause and finish the remaining commands manually rather than rerunning the script. This does not publish to npm.
+
 ## Contributing
 
 ### AI policy and usage disclosure
