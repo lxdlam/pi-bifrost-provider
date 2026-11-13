@@ -14,6 +14,9 @@ export function release(version: string, root = ROOT, run: Run = runCommand): vo
 		throw new Error("Usage: npm run release -- x.y.z (without a v prefix or leading zeroes)");
 	}
 	const tag = `v${version}`;
+	const branch = `release/${tag}`;
+	const npmCli = process.env.npm_execpath;
+	if (!npmCli) throw new Error("Run this script with npm run release -- x.y.z");
 	if (run("git", ["status", "--porcelain"], root).trim()) {
 		throw new Error("Working tree must be clean before releasing.");
 	}
@@ -22,25 +25,39 @@ export function release(version: string, root = ROOT, run: Run = runCommand): vo
 	}
 	run("git", ["remote", "get-url", "origin"], root);
 	run("gh", ["auth", "status"], root);
+	const base = run("gh", ["repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"], root).trim();
+	if (!base) throw new Error("Could not determine the repository's default branch.");
 
 	const packagePath = join(root, "package.json");
-	const lockPath = join(root, "package-lock.json");
 	const pkg: { version: string } = JSON.parse(readFileSync(packagePath, "utf8"));
-	const lock: { version: string; packages: Record<string, { version: string }> } = JSON.parse(
-		readFileSync(lockPath, "utf8"),
-	);
-	if (!lock.packages[""]) throw new Error("package-lock.json is missing its root package.");
 	pkg.version = version;
-	lock.version = version;
-	lock.packages[""].version = version;
 
-	// Tag the existing commit, not the uncommitted version bump.
-	run("git", ["tag", tag, "HEAD"], root);
+	run("git", ["switch", "-c", branch], root);
 	writeFileSync(packagePath, `${JSON.stringify(pkg, null, 2)}\n`);
-	writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+	run(process.execPath, [npmCli, "install", "--package-lock-only", "--ignore-scripts"], root);
+
+	run("git", ["add", "--", "package.json", "package-lock.json"], root);
+	run("git", ["commit", "-m", `chore: release ${tag}`], root);
+	run("git", ["tag", tag, "HEAD"], root);
+	run("git", ["push", "--set-upstream", "origin", branch], root);
 	run("git", ["push", "origin", `refs/tags/${tag}`], root);
-	run("gh", ["release", "create", tag, "--verify-tag", "--generate-notes"], root);
-	console.log(`Released ${tag}. The version bump is uncommitted; review and commit it separately.`);
+	const pr = run(
+		"gh",
+		[
+			"pr",
+			"create",
+			"--base",
+			base,
+			"--head",
+			branch,
+			"--title",
+			`chore: release ${tag}`,
+			"--body",
+			`Bump the package version to ${version} and regenerate package-lock.json with npm.\n\nTag: ${tag}.`,
+		],
+		root,
+	).trim();
+	console.log(`Release PR: ${pr}`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
