@@ -101,7 +101,9 @@ You can temporarily override `BIFROST_API_KEY` with Pi's `--api-key` option. The
 Pi passes the active conversation's `sessionId` on every turn. The provider forwards it to Bifrost in two ways so multi-turn conversations are grouped in Bifrost logs and sticky-routed across upstream providers:
 
 - **`x-bf-session-id`** — attached directly on every chat completion request when `options.sessionId` is present (unless the caller already supplied `x-bf-session-id`).
-- **`x-session-id`** — enabled via `compat.sendSessionAffinityHeaders: true` (`sessionAffinityFormat: "openrouter"`) on discovered models.
+- **`x-session-id`** — attached the same way, regardless of cache retention, and also enabled via `compat.sendSessionAffinityHeaders: true` (`sessionAffinityFormat: "openrouter"`) on discovered models.
+
+The session ID is trimmed (a blank one is dropped), and the trimmed value is what the rest of the request uses, including `prompt_cache_key`. `x-bf-session-id` always takes precedence in Bifrost; adopting `x-session-id` as a session requires Bifrost v2.0.0+ — older gateways only honor `x-bf-session-id`.
 
 ### Model metadata
 

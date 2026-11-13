@@ -52,6 +52,7 @@ These are documented inline in `index.ts` — read the comment at the site befor
 - **`pricePerMillion` heuristically converts per-token prices** (values ≤ 0.01 are multiplied by 1e6). Changing the threshold silently corrupts pricing for real catalogs — don't touch without tests covering both units.
 - **URL normalization** (`normalizeBifrostUrl`) accepts instance URLs, `/openai` mounts, and existing `/v1` bases, and strips trailing endpoint paths. New URL behavior needs cases in the "normalizes Bifrost instance and API URLs" test.
 - **Credential precedence**: stored `/login` credentials > CLI flags > environment. A credential that carries its own URL "owns" its config — ambient fallbacks must not leak into it (see `credentialConfig`).
+- **Session headers ride on the wrapped `bifrostCompletionsApi()`** (passed to `createProvider({ api })`), which sets `x-bf-session-id` and `x-session-id` and normalizes `sessionId` (see `withBifrostSessionHeader`). The compat `sendSessionAffinityHeaders` path is not enough on its own: the adapter skips it when cache retention is `"none"`. Swapping back to a bare `openAICompletionsApi()` silently stops the session headers from reaching Bifrost, so multi-turn logs lose grouping and session affinity; only the mock streaming tests would notice.
 
 ## Testing conventions
 
