@@ -942,11 +942,20 @@ export default async function bifrostProvider(pi: ExtensionAPI): Promise<void> {
 	// prevent the extension from loading. If it fails here, the provider is
 	// still registered with `models: undefined`; refreshModels() (using
 	// /login-persisted models or a later successful fetch) retries recovery.
-	let models: BifrostProviderModel[] | undefined;
+	// Overrides are read regardless of startup config: a /login-only user
+	// (no BIFROST_URL/flag config) still has pinned ids and must not hear the
+	// "pin exact values" advice from the default-limit notices.
 	let overrides: ReadonlyMap<string, ModelOverride> | undefined;
+	try {
+		overrides = await readOverrides(await pickAgentDir());
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		notify(`failed to read models.json overrides, limit notices stay unfiltered: ${detail}`, "warning");
+	}
+
+	let models: BifrostProviderModel[] | undefined;
 	if (config) {
 		try {
-			overrides = await readOverrides(await pickAgentDir());
 			models = await fetchBifrostModels(config, { signal: AbortSignal.timeout(15_000), notify, overrides });
 		} catch (error) {
 			const detail = error instanceof Error ? error.message : String(error);
