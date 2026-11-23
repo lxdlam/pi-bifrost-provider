@@ -652,3 +652,17 @@ test("readOverrides drops non-positive limits and garbage entries, empty map on 
 test("readOverrides tolerates a missing models.json", async () => {
 	assert.deepEqual(await readOverrides(await tempAgentDir()), new Map());
 });
+
+test("reports models left on defaults but skips ids with overrides", async () => {
+	const notices: Array<{ message: string; type?: string }> = [];
+	const notify = (message: string, type?: "info" | "warning" | "error") => notices.push({ message, type });
+	const options = { fetch: discoveryFetch([{ id: "CommandCode/claude-opus-5-5" }]), metadata: null, notify };
+	const overrides = new Map([["CommandCode/claude-opus-5-5", { contextWindow: 200_000, maxTokens: 100_000 }]]);
+
+	await fetchBifrostModels({ url: DISCOVERY_URL }, { ...options, overrides });
+	assert.equal(notices.length, 0);
+
+	await fetchBifrostModels({ url: DISCOVERY_URL }, options);
+	assert.equal(notices.length, 1);
+	assert.match(notices[0]?.message ?? "", /CommandCode\/claude-opus-5-5/u);
+});

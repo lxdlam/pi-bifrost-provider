@@ -483,12 +483,17 @@ export async function readOverrides(directory: string): Promise<Map<string, Mode
 /**
  * Announce models left on {@link DEFAULT_CONTEXT_WINDOW} because neither
  * Bifrost nor the fallback catalog knew their limits. Announced once per id
- * per process so refresh loops stay quiet.
+ * per process so refresh loops stay quiet. Ids pinned via models.json
+ * modelOverrides are excluded — the notice's own advice was followed there.
  */
 const announcedMissingContext = new Set<string>();
-function announceMissingContext(ids: readonly string[], notify: DiscoveryNotifier | undefined): void {
+function announceMissingContext(
+	ids: readonly string[],
+	overrides: ReadonlyMap<string, ModelOverride> | undefined,
+	notify: DiscoveryNotifier | undefined,
+): void {
 	if (!notify) return;
-	const unannounced = ids.filter((id) => !announcedMissingContext.has(id));
+	const unannounced = ids.filter((id) => !announcedMissingContext.has(id) && !overrides?.has(id));
 	if (unannounced.length === 0) return;
 	for (const id of unannounced) announcedMissingContext.add(id);
 	const preview = `${unannounced.slice(0, 5).join(", ")}${unannounced.length > 5 ? ", ..." : ""}`;
@@ -632,6 +637,7 @@ export async function fetchBifrostModels(
 		signal?: AbortSignal;
 		metadata?: ModelMetadataIndex | null;
 		notify?: DiscoveryNotifier;
+		overrides?: ReadonlyMap<string, ModelOverride>;
 	} = {},
 ): Promise<BifrostProviderModel[]> {
 	const fetchImpl = options.fetch ?? globalThis.fetch;
@@ -675,6 +681,7 @@ export async function fetchBifrostModels(
 			.filter((entry) => missingLimits(entry) && metadataFor(metadata, entry.id ?? "") === undefined)
 			.map((entry) => entry.id)
 			.filter((id): id is string => id !== undefined),
+		options.overrides,
 		options.notify,
 	);
 	return uniqueModels;
