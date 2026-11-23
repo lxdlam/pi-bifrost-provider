@@ -449,6 +449,37 @@ export async function loadMetadataIndex(
  */
 export type DiscoveryNotifier = (message: string, type?: "info" | "warning" | "error") => void;
 
+/** Pinned limits for one model id, as read from models.json modelOverrides. */
+export type ModelOverride = { contextWindow?: number; maxTokens?: number };
+
+/**
+ * Read providers.bifrost.modelOverrides — the exact, typed key pi core
+ * applies as its topmost user-config layer — from an agent dir's models.json.
+ * Never rejects: a missing, unreadable, or unparseable file yields an empty
+ * map and leaves the notices unchanged.
+ */
+export async function readOverrides(directory: string): Promise<Map<string, ModelOverride>> {
+	const overrides = new Map<string, ModelOverride>();
+	try {
+		const document = JSON.parse(await readFile(join(directory, "models.json"), "utf8")) as {
+			providers?: { bifrost?: { modelOverrides?: Record<string, ModelOverride> } };
+		};
+		for (const [id, value] of Object.entries(document.providers?.bifrost?.modelOverrides ?? {})) {
+			if (typeof value !== "object" || value === null) continue;
+			const contextWindow = positiveInteger(value.contextWindow);
+			const maxTokens = positiveInteger(value.maxTokens);
+			if (contextWindow === undefined && maxTokens === undefined) continue;
+			const entry: ModelOverride = {};
+			if (contextWindow !== undefined) entry.contextWindow = contextWindow;
+			if (maxTokens !== undefined) entry.maxTokens = maxTokens;
+			overrides.set(id, entry);
+		}
+	} catch {
+		// Missing/unparseable models.json must not fail discovery (best-effort contract).
+	}
+	return overrides;
+}
+
 /**
  * Announce models left on {@link DEFAULT_CONTEXT_WINDOW} because neither
  * Bifrost nor the fallback catalog knew their limits. Announced once per id

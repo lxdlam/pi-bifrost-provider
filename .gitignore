@@ -1,4 +1,5 @@
-node_modules/
-*.log
-.mock-*
 .claude/settings.local.json
+.mock-*
+.superpowers/
+*.log
+node_modules/

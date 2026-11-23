@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -18,6 +18,7 @@ import {
 	metadataFor,
 	normalizeBifrostUrl,
 	normalizeModelKey,
+	readOverrides,
 	SESSION_AFFINITY_HEADER,
 	toProviderModel,
 	withBifrostSessionHeader,
@@ -467,6 +468,10 @@ function discoveryFetch(entries: unknown[]): typeof fetch {
 	return async () => Response.json({ data: entries });
 }
 
+async function tempAgentDir(): Promise<string> {
+	return mkdtemp(join(tmpdir(), "bifrost-agent-"));
+}
+
 const offlineFetch: typeof fetch = async () => {
 	throw new Error("offline");
 };
@@ -591,4 +596,59 @@ test("reports models left on the default limits through the notice sink", async 
 
 	// A provider used without a sink (SDK, headless) stays silent.
 	assert.doesNotThrow(() => fetchBifrostModels({ url: DISCOVERY_URL }, { ...options, notify: undefined }));
+});
+
+test("readOverrides parses providers.bifrost.modelOverrides into a map", async () => {
+	const dir = await tempAgentDir();
+	await writeFile(
+		join(dir, "models.json"),
+		JSON.stringify({
+			providers: {
+				bifrost: {
+					modelOverrides: {
+						"vllm/Mistral-Large-4-1T-A52B-NVFP4": { contextWindow: 131072, maxTokens: 32768 },
+					},
+				},
+			},
+		}),
+	);
+	const overrides = await readOverrides(dir);
+	assert.deepEqual(overrides.get("vllm/Mistral-Large-4-1T-A52B-NVFP4"), { contextWindow: 131072, maxTokens: 32768 });
+	assert.equal(overrides.size, 1);
+});
+
+test("readOverrides reads only the exact bifrost key and honors one-sided pins", async () => {
+	const dir = await tempAgentDir();
+	await writeFile(
+		join(dir, "models.json"),
+		JSON.stringify({
+			providers: {
+				"my-bifrost-proxy": { modelOverrides: { "kept/out": { contextWindow: 1000 } } },
+				bifrost: { modelOverrides: { "kept/in": { maxTokens: 1000 } } },
+			},
+		}),
+	);
+	const overrides = await readOverrides(dir);
+	assert.deepEqual(overrides.get("kept/in"), { maxTokens: 1000 });
+	assert.equal(overrides.get("kept/out"), undefined);
+	assert.equal(overrides.size, 1);
+});
+
+test("readOverrides drops non-positive limits and garbage entries, empty map on broken JSON", async () => {
+	const dir = await tempAgentDir();
+	await writeFile(
+		join(dir, "models.json"),
+		JSON.stringify({
+			providers: { bifrost: { modelOverrides: { "a/b": { contextWindow: 0, maxTokens: -1 }, "c/d": "banana" } } },
+		}),
+	);
+	const filtered = await readOverrides(dir);
+	assert.equal(filtered.size, 0);
+
+	await writeFile(join(dir, "models.json"), "{ not json at all");
+	assert.deepEqual(await readOverrides(dir), new Map());
+});
+
+test("readOverrides tolerates a missing models.json", async () => {
+	assert.deepEqual(await readOverrides(await tempAgentDir()), new Map());
 });
