@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createModels, type SimpleStreamOptions, type StreamOptions } from "@earendil-works/pi-ai/compat";
@@ -18,6 +18,7 @@ import {
 	metadataFor,
 	normalizeBifrostUrl,
 	normalizeModelKey,
+	pickAgentDir,
 	readOverrides,
 	SESSION_AFFINITY_HEADER,
 	toProviderModel,
@@ -665,4 +666,17 @@ test("reports models left on defaults but skips ids with overrides", async () =>
 	await fetchBifrostModels({ url: DISCOVERY_URL }, options);
 	assert.equal(notices.length, 1);
 	assert.match(notices[0]?.message ?? "", /CommandCode\/claude-opus-5-5/u);
+});
+
+test("pickAgentDir honors PI_CODING_AGENT_DIR and falls back to ~/.pi/agent", async () => {
+	const dir = await tempAgentDir();
+	const saved = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = dir;
+	try {
+		assert.equal(await pickAgentDir(), dir);
+	} finally {
+		if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = saved;
+	}
+	assert.equal(await pickAgentDir(), join(homedir(), ".pi", "agent"));
 });

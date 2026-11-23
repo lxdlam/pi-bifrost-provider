@@ -481,6 +481,22 @@ export async function readOverrides(directory: string): Promise<Map<string, Mode
 }
 
 /**
+ * The agent config directory holding models.json (~/.pi/agent by default,
+ * PI_CODING_AGENT_DIR override — mirrors pi's own getAgentDir()). Resolved
+ * through a dynamic import because pi-coding-agent is an optional peer at
+ * runtime: without it (SDK use outside pi), the documented default location
+ * applies and readOverrides still finds a models.json there.
+ */
+export async function pickAgentDir(): Promise<string> {
+	try {
+		const { getAgentDir } = await import("@earendil-works/pi-coding-agent");
+		return getAgentDir();
+	} catch {
+		return join(homedir(), ".pi", "agent");
+	}
+}
+
+/**
  * Announce models left on {@link DEFAULT_CONTEXT_WINDOW} because neither
  * Bifrost nor the fallback catalog knew their limits. Announced once per id
  * per process so refresh loops stay quiet. Ids pinned via models.json
@@ -735,6 +751,8 @@ export interface CreateBifrostProviderOptions {
 	fetch?: Fetch;
 	/** Where discovery notices go; see {@link DiscoveryNotifier}. */
 	notify?: DiscoveryNotifier;
+	/** models.json modelOverrides; suppresses limit notices for pinned ids. */
+	overrides?: ReadonlyMap<string, ModelOverride>;
 }
 
 /** Create the native provider used by Pi, including its /login setup flow. */
@@ -782,7 +800,12 @@ export function createBifrostProvider(options: CreateBifrostProviderOptions = {}
 		);
 		if (!config) return;
 		const discovered = runtimeModels(
-			await fetchBifrostModels(config, { fetch: fetchImpl, signal: context.signal, notify: options.notify }),
+			await fetchBifrostModels(config, {
+				fetch: fetchImpl,
+				signal: context.signal,
+				notify: options.notify,
+				overrides: options.overrides,
+			}),
 			config.url,
 		);
 		await context.publish({
@@ -920,14 +943,16 @@ export default async function bifrostProvider(pi: ExtensionAPI): Promise<void> {
 	// still registered with `models: undefined`; refreshModels() (using
 	// /login-persisted models or a later successful fetch) retries recovery.
 	let models: BifrostProviderModel[] | undefined;
+	let overrides: ReadonlyMap<string, ModelOverride> | undefined;
 	if (config) {
 		try {
-			models = await fetchBifrostModels(config, { signal: AbortSignal.timeout(15_000), notify });
+			overrides = await readOverrides(await pickAgentDir());
+			models = await fetchBifrostModels(config, { signal: AbortSignal.timeout(15_000), notify, overrides });
 		} catch (error) {
 			const detail = error instanceof Error ? error.message : String(error);
 			notify(`startup model discovery failed, continuing without a preloaded catalog: ${detail}`, "error");
 		}
 	}
 
-	pi.registerProvider(createBifrostProvider({ config, models, notify }));
+	pi.registerProvider(createBifrostProvider({ config, models, notify, overrides }));
 }
