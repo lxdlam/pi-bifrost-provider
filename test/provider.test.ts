@@ -654,6 +654,40 @@ test("readOverrides tolerates a missing models.json", async () => {
 	assert.deepEqual(await readOverrides(await tempAgentDir()), new Map());
 });
 
+test("readOverrides parses comment-bearing models.json the way pi does", async () => {
+	const dir = await tempAgentDir();
+	await writeFile(
+		join(dir, "models.json"),
+		`{
+	// pinned limits for the private vLLM catalog
+	"providers": {
+		"bifrost": {
+			"baseUrl": "http://host/v1", // url literal must survive the strip
+			"modelOverrides": {
+				"some/Id": { "contextWindow": 131072, "maxTokens": 32768, },
+			},
+		},
+	},
+}
+`,
+	);
+	const overrides = await readOverrides(dir);
+	assert.deepEqual(overrides.get("some/Id"), { contextWindow: 131072, maxTokens: 32768 });
+	assert.equal(overrides.size, 1);
+});
+
+test("readOverrides yields an empty map when stripping comments cannot rescue the JSON", async () => {
+	const dir = await tempAgentDir();
+	await writeFile(
+		join(dir, "models.json"),
+		`{
+	// unbalanced brace
+	"providers": { "bifrost": { "modelOverrides": { "some/Id": { "contextWindow": 1000, },
+`,
+	);
+	assert.deepEqual(await readOverrides(dir), new Map());
+});
+
 test("reports models left on defaults but skips ids with overrides", async () => {
 	const notices: Array<{ message: string; type?: string }> = [];
 	const notify = (message: string, type?: "info" | "warning" | "error") => notices.push({ message, type });

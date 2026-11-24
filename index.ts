@@ -452,6 +452,13 @@ export type DiscoveryNotifier = (message: string, type?: "info" | "warning" | "e
 /** Pinned limits for one model id, as read from models.json modelOverrides. */
 export type ModelOverride = { contextWindow?: number; maxTokens?: number };
 
+/** Strips `//` line comments and trailing commas outside string literals, as pi core does before parsing models.json. */
+function stripJsonComments(input: string): string {
+	return input
+		.replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (match) => (match[0] === '"' ? match : ""))
+		.replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (match, tail?: string) => tail ?? match);
+}
+
 /**
  * Read providers.bifrost.modelOverrides — the exact, typed key pi core
  * applies as its topmost user-config layer — from an agent dir's models.json.
@@ -461,7 +468,7 @@ export type ModelOverride = { contextWindow?: number; maxTokens?: number };
 export async function readOverrides(directory: string): Promise<Map<string, ModelOverride>> {
 	const overrides = new Map<string, ModelOverride>();
 	try {
-		const document = JSON.parse(await readFile(join(directory, "models.json"), "utf8")) as {
+		const document = JSON.parse(stripJsonComments(await readFile(join(directory, "models.json"), "utf8"))) as {
 			providers?: { bifrost?: { modelOverrides?: Record<string, ModelOverride> } };
 		};
 		for (const [id, value] of Object.entries(document.providers?.bifrost?.modelOverrides ?? {})) {
