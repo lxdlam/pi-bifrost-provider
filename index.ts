@@ -449,15 +449,74 @@ export async function loadMetadataIndex(
  */
 export type DiscoveryNotifier = (message: string, type?: "info" | "warning" | "error") => void;
 
+/** Pinned limits for one model id, as read from models.json modelOverrides. */
+export type ModelOverride = { contextWindow?: number; maxTokens?: number };
+
+/** Strips `//` line comments and trailing commas outside string literals, as pi core does before parsing models.json. */
+function stripJsonComments(input: string): string {
+	return input
+		.replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (match) => (match[0] === '"' ? match : ""))
+		.replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (match, tail?: string) => tail ?? match);
+}
+
+/**
+ * Read providers.bifrost.modelOverrides — the exact, typed key pi core
+ * applies as its topmost user-config layer — from an agent dir's models.json.
+ * Never rejects: a missing, unreadable, or unparseable file yields an empty
+ * map and leaves the notices unchanged.
+ */
+export async function readOverrides(directory: string): Promise<Map<string, ModelOverride>> {
+	const overrides = new Map<string, ModelOverride>();
+	try {
+		const document = JSON.parse(stripJsonComments(await readFile(join(directory, "models.json"), "utf8"))) as {
+			providers?: { bifrost?: { modelOverrides?: Record<string, ModelOverride> } };
+		};
+		for (const [id, value] of Object.entries(document.providers?.bifrost?.modelOverrides ?? {})) {
+			if (typeof value !== "object" || value === null) continue;
+			const contextWindow = positiveInteger(value.contextWindow);
+			const maxTokens = positiveInteger(value.maxTokens);
+			if (contextWindow === undefined && maxTokens === undefined) continue;
+			const entry: ModelOverride = {};
+			if (contextWindow !== undefined) entry.contextWindow = contextWindow;
+			if (maxTokens !== undefined) entry.maxTokens = maxTokens;
+			overrides.set(id, entry);
+		}
+	} catch {
+		// Missing/unparseable models.json must not fail discovery (best-effort contract).
+	}
+	return overrides;
+}
+
+/**
+ * The agent config directory holding models.json (~/.pi/agent by default,
+ * PI_CODING_AGENT_DIR override — mirrors pi's own getAgentDir()). Resolved
+ * through a dynamic import because pi-coding-agent is an optional peer at
+ * runtime: without it (SDK use outside pi), the documented default location
+ * applies and readOverrides still finds a models.json there.
+ */
+export async function pickAgentDir(): Promise<string> {
+	try {
+		const { getAgentDir } = await import("@earendil-works/pi-coding-agent");
+		return getAgentDir();
+	} catch {
+		return join(homedir(), ".pi", "agent");
+	}
+}
+
 /**
  * Announce models left on {@link DEFAULT_CONTEXT_WINDOW} because neither
  * Bifrost nor the fallback catalog knew their limits. Announced once per id
- * per process so refresh loops stay quiet.
+ * per process so refresh loops stay quiet. Ids pinned via models.json
+ * modelOverrides are excluded — the notice's own advice was followed there.
  */
 const announcedMissingContext = new Set<string>();
-function announceMissingContext(ids: readonly string[], notify: DiscoveryNotifier | undefined): void {
+function announceMissingContext(
+	ids: readonly string[],
+	overrides: ReadonlyMap<string, ModelOverride> | undefined,
+	notify: DiscoveryNotifier | undefined,
+): void {
 	if (!notify) return;
-	const unannounced = ids.filter((id) => !announcedMissingContext.has(id));
+	const unannounced = ids.filter((id) => !announcedMissingContext.has(id) && !overrides?.has(id));
 	if (unannounced.length === 0) return;
 	for (const id of unannounced) announcedMissingContext.add(id);
 	const preview = `${unannounced.slice(0, 5).join(", ")}${unannounced.length > 5 ? ", ..." : ""}`;
@@ -601,6 +660,7 @@ export async function fetchBifrostModels(
 		signal?: AbortSignal;
 		metadata?: ModelMetadataIndex | null;
 		notify?: DiscoveryNotifier;
+		overrides?: ReadonlyMap<string, ModelOverride>;
 	} = {},
 ): Promise<BifrostProviderModel[]> {
 	const fetchImpl = options.fetch ?? globalThis.fetch;
@@ -644,6 +704,7 @@ export async function fetchBifrostModels(
 			.filter((entry) => missingLimits(entry) && metadataFor(metadata, entry.id ?? "") === undefined)
 			.map((entry) => entry.id)
 			.filter((id): id is string => id !== undefined),
+		options.overrides,
 		options.notify,
 	);
 	return uniqueModels;
@@ -697,6 +758,8 @@ export interface CreateBifrostProviderOptions {
 	fetch?: Fetch;
 	/** Where discovery notices go; see {@link DiscoveryNotifier}. */
 	notify?: DiscoveryNotifier;
+	/** models.json modelOverrides; suppresses limit notices for pinned ids. */
+	overrides?: ReadonlyMap<string, ModelOverride>;
 }
 
 /** Create the native provider used by Pi, including its /login setup flow. */
@@ -744,7 +807,12 @@ export function createBifrostProvider(options: CreateBifrostProviderOptions = {}
 		);
 		if (!config) return;
 		const discovered = runtimeModels(
-			await fetchBifrostModels(config, { fetch: fetchImpl, signal: context.signal, notify: options.notify }),
+			await fetchBifrostModels(config, {
+				fetch: fetchImpl,
+				signal: context.signal,
+				notify: options.notify,
+				overrides: options.overrides,
+			}),
 			config.url,
 		);
 		await context.publish({
@@ -881,15 +949,26 @@ export default async function bifrostProvider(pi: ExtensionAPI): Promise<void> {
 	// prevent the extension from loading. If it fails here, the provider is
 	// still registered with `models: undefined`; refreshModels() (using
 	// /login-persisted models or a later successful fetch) retries recovery.
+	// Overrides are read regardless of startup config: a /login-only user
+	// (no BIFROST_URL/flag config) still has pinned ids and must not hear the
+	// "pin exact values" advice from the default-limit notices.
+	let overrides: ReadonlyMap<string, ModelOverride> | undefined;
+	try {
+		overrides = await readOverrides(await pickAgentDir());
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		notify(`failed to read models.json overrides, limit notices stay unfiltered: ${detail}`, "warning");
+	}
+
 	let models: BifrostProviderModel[] | undefined;
 	if (config) {
 		try {
-			models = await fetchBifrostModels(config, { signal: AbortSignal.timeout(15_000), notify });
+			models = await fetchBifrostModels(config, { signal: AbortSignal.timeout(15_000), notify, overrides });
 		} catch (error) {
 			const detail = error instanceof Error ? error.message : String(error);
 			notify(`startup model discovery failed, continuing without a preloaded catalog: ${detail}`, "error");
 		}
 	}
 
-	pi.registerProvider(createBifrostProvider({ config, models, notify }));
+	pi.registerProvider(createBifrostProvider({ config, models, notify, overrides }));
 }

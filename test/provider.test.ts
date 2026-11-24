@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createModels, type SimpleStreamOptions, type StreamOptions } from "@earendil-works/pi-ai/compat";
@@ -18,6 +18,8 @@ import {
 	metadataFor,
 	normalizeBifrostUrl,
 	normalizeModelKey,
+	pickAgentDir,
+	readOverrides,
 	SESSION_AFFINITY_HEADER,
 	toProviderModel,
 	withBifrostSessionHeader,
@@ -467,6 +469,10 @@ function discoveryFetch(entries: unknown[]): typeof fetch {
 	return async () => Response.json({ data: entries });
 }
 
+async function tempAgentDir(): Promise<string> {
+	return mkdtemp(join(tmpdir(), "bifrost-agent-"));
+}
+
 const offlineFetch: typeof fetch = async () => {
 	throw new Error("offline");
 };
@@ -591,4 +597,120 @@ test("reports models left on the default limits through the notice sink", async 
 
 	// A provider used without a sink (SDK, headless) stays silent.
 	assert.doesNotThrow(() => fetchBifrostModels({ url: DISCOVERY_URL }, { ...options, notify: undefined }));
+});
+
+test("readOverrides parses providers.bifrost.modelOverrides into a map", async () => {
+	const dir = await tempAgentDir();
+	await writeFile(
+		join(dir, "models.json"),
+		JSON.stringify({
+			providers: {
+				bifrost: {
+					modelOverrides: {
+						"vllm/Mistral-Large-4-1T-A52B-NVFP4": { contextWindow: 131072, maxTokens: 32768 },
+					},
+				},
+			},
+		}),
+	);
+	const overrides = await readOverrides(dir);
+	assert.deepEqual(overrides.get("vllm/Mistral-Large-4-1T-A52B-NVFP4"), { contextWindow: 131072, maxTokens: 32768 });
+	assert.equal(overrides.size, 1);
+});
+
+test("readOverrides reads only the exact bifrost key and honors one-sided pins", async () => {
+	const dir = await tempAgentDir();
+	await writeFile(
+		join(dir, "models.json"),
+		JSON.stringify({
+			providers: {
+				"my-bifrost-proxy": { modelOverrides: { "kept/out": { contextWindow: 1000 } } },
+				bifrost: { modelOverrides: { "kept/in": { maxTokens: 1000 } } },
+			},
+		}),
+	);
+	const overrides = await readOverrides(dir);
+	assert.deepEqual(overrides.get("kept/in"), { maxTokens: 1000 });
+	assert.equal(overrides.get("kept/out"), undefined);
+	assert.equal(overrides.size, 1);
+});
+
+test("readOverrides drops non-positive limits and garbage entries, empty map on broken JSON", async () => {
+	const dir = await tempAgentDir();
+	await writeFile(
+		join(dir, "models.json"),
+		JSON.stringify({
+			providers: { bifrost: { modelOverrides: { "a/b": { contextWindow: 0, maxTokens: -1 }, "c/d": "banana" } } },
+		}),
+	);
+	const filtered = await readOverrides(dir);
+	assert.equal(filtered.size, 0);
+
+	await writeFile(join(dir, "models.json"), "{ not json at all");
+	assert.deepEqual(await readOverrides(dir), new Map());
+});
+
+test("readOverrides tolerates a missing models.json", async () => {
+	assert.deepEqual(await readOverrides(await tempAgentDir()), new Map());
+});
+
+test("readOverrides parses comment-bearing models.json the way pi does", async () => {
+	const dir = await tempAgentDir();
+	await writeFile(
+		join(dir, "models.json"),
+		`{
+	// pinned limits for the private vLLM catalog
+	"providers": {
+		"bifrost": {
+			"baseUrl": "http://host/v1", // url literal must survive the strip
+			"modelOverrides": {
+				"some/Id": { "contextWindow": 131072, "maxTokens": 32768, },
+			},
+		},
+	},
+}
+`,
+	);
+	const overrides = await readOverrides(dir);
+	assert.deepEqual(overrides.get("some/Id"), { contextWindow: 131072, maxTokens: 32768 });
+	assert.equal(overrides.size, 1);
+});
+
+test("readOverrides yields an empty map when stripping comments cannot rescue the JSON", async () => {
+	const dir = await tempAgentDir();
+	await writeFile(
+		join(dir, "models.json"),
+		`{
+	// unbalanced brace
+	"providers": { "bifrost": { "modelOverrides": { "some/Id": { "contextWindow": 1000, },
+`,
+	);
+	assert.deepEqual(await readOverrides(dir), new Map());
+});
+
+test("reports models left on defaults but skips ids with overrides", async () => {
+	const notices: Array<{ message: string; type?: string }> = [];
+	const notify = (message: string, type?: "info" | "warning" | "error") => notices.push({ message, type });
+	const options = { fetch: discoveryFetch([{ id: "CommandCode/claude-opus-5-5" }]), metadata: null, notify };
+	const overrides = new Map([["CommandCode/claude-opus-5-5", { contextWindow: 200_000, maxTokens: 100_000 }]]);
+
+	await fetchBifrostModels({ url: DISCOVERY_URL }, { ...options, overrides });
+	assert.equal(notices.length, 0);
+
+	await fetchBifrostModels({ url: DISCOVERY_URL }, options);
+	assert.equal(notices.length, 1);
+	assert.match(notices[0]?.message ?? "", /CommandCode\/claude-opus-5-5/u);
+});
+
+test("pickAgentDir honors PI_CODING_AGENT_DIR and falls back to ~/.pi/agent", async () => {
+	const dir = await tempAgentDir();
+	const saved = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = dir;
+	try {
+		assert.equal(await pickAgentDir(), dir);
+	} finally {
+		if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = saved;
+	}
+	assert.equal(await pickAgentDir(), join(homedir(), ".pi", "agent"));
 });

@@ -115,6 +115,7 @@ Bifrost often returns only `id`, `object`, `owned_by`, and `created` — for Ope
 - Lookups strip the gateway prefix, so `CommandCode/claude-opus-5-5` matches `claude-opus-5-5`, and ignore `:free` tags and `-YYYYMMDD` suffixes.
 - The catalog is fetched at most once a day and cached under `~/.cache/pi-bifrost-provider/models-dev.json`. An unreachable catalog falls back to a stale cache and then to the defaults, and never fails discovery.
 - Models that end up on the defaults anyway are reported once per session through Pi's notification UI, with a pointer to `modelOverrides`.
+- Ids pinned via `providers.bifrost.modelOverrides` in `~/.pi/agent/models.json` — exactly the path the notice recommends — are not announced: they are already off the defaults.
 
 To pin exact limits for one model, override them in `~/.pi/agent/models.json`; the provider is not involved in that path:
 
